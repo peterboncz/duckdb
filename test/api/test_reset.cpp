@@ -118,6 +118,7 @@ OptionValueSet GetValueForOption(const string &name, const LogicalType &type) {
 	    {"progress_bar_time", {0}},
 	    {"temp_directory", {"tmp"}},
 	    {"wal_autocheckpoint", {"4.0 GiB"}},
+	    {"for_vectors", {false}},
 	    {"force_bitpacking_mode", {"constant"}},
 	    {"enable_http_logging", {false}},
 	    {"http_proxy", {"localhost:80"}},

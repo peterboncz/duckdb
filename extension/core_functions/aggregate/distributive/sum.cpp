@@ -73,6 +73,34 @@ struct HugeintSumOperation : public BaseSumOperation<SumSetOperation, HugeintAdd
 	}
 };
 
+template <class STATE, class INPUT_TYPE, class OP, class ADDOP>
+static void FORSumSimpleUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                               data_ptr_t state_p, idx_t count) {
+	D_ASSERT(input_count == 1);
+	auto &state = *reinterpret_cast<STATE *>(state_p);
+	if (TryFORSimpleSumUpdate<INPUT_TYPE, STATE, ADDOP>(inputs[0], state, count)) {
+		return;
+	}
+	AggregateFunction::UnaryUpdate<STATE, INPUT_TYPE, OP>(inputs, aggr_input_data, input_count, state_p, count);
+}
+
+template <class STATE, class INPUT_TYPE, class OP, class ADDOP>
+static void FORSumScatterUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &states,
+                                idx_t count) {
+	D_ASSERT(input_count == 1);
+	if (TryFORGroupedSumUpdate<INPUT_TYPE, STATE, ADDOP>(inputs[0], states, count)) {
+		return;
+	}
+	AggregateFunction::UnaryScatterUpdate<STATE, INPUT_TYPE, OP>(inputs, aggr_input_data, input_count, states, count);
+}
+
+template <class STATE, class INPUT_TYPE, class OP, class ADDOP>
+static AggregateFunction SetFORSumCallbacks(AggregateFunction function) {
+	function.SetStateSimpleUpdateCallback(FORSumSimpleUpdate<STATE, INPUT_TYPE, OP, ADDOP>);
+	function.SetStateUpdateCallback(FORSumScatterUpdate<STATE, INPUT_TYPE, OP, ADDOP>);
+	return function;
+}
+
 template <class T>
 static LogicalType GetValueLogicalType();
 
@@ -122,8 +150,9 @@ unique_ptr<FunctionData> SumNoOverflowDeserialize(Deserializer &deserializer, Ag
 AggregateFunction GetSumAggregateNoOverflow(PhysicalType type) {
 	switch (type) {
 	case PhysicalType::INT32: {
-		auto function = AggregateFunction::UnaryAggregate<SumState<int64_t>, int32_t, hugeint_t, IntegerSumOperation>(
-		    LogicalType::INTEGER, LogicalType::HUGEINT);
+		auto function = SetFORSumCallbacks<SumState<int64_t>, int32_t, IntegerSumOperation, RegularAdd>(
+		    AggregateFunction::UnaryAggregate<SumState<int64_t>, int32_t, hugeint_t, IntegerSumOperation>(
+		        LogicalType::INTEGER, LogicalType::HUGEINT));
 		function.name = "sum_no_overflow";
 		function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 		function.SetBindCallback(SumNoOverflowBind);
@@ -132,8 +161,9 @@ AggregateFunction GetSumAggregateNoOverflow(PhysicalType type) {
 		return function.SetStructStateExport(GetSumStateType<int64_t>);
 	}
 	case PhysicalType::INT64: {
-		auto function = AggregateFunction::UnaryAggregate<SumState<int64_t>, int64_t, hugeint_t, IntegerSumOperation>(
-		    LogicalType::BIGINT, LogicalType::HUGEINT);
+		auto function = SetFORSumCallbacks<SumState<int64_t>, int64_t, IntegerSumOperation, RegularAdd>(
+		    AggregateFunction::UnaryAggregate<SumState<int64_t>, int64_t, hugeint_t, IntegerSumOperation>(
+		        LogicalType::BIGINT, LogicalType::HUGEINT));
 		function.name = "sum_no_overflow";
 		function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 		function.SetBindCallback(SumNoOverflowBind);
@@ -205,17 +235,17 @@ AggregateFunction GetSumAggregate(PhysicalType type) {
 	}
 
 	case PhysicalType::INT32: {
-		auto function =
+		auto function = SetFORSumCallbacks<SumState<hugeint_t>, int32_t, SumToHugeintOperation, AddToHugeint>(
 		    AggregateFunction::UnaryAggregate<SumState<hugeint_t>, int32_t, hugeint_t, SumToHugeintOperation>(
-		        LogicalType::INTEGER, LogicalType::HUGEINT);
+		        LogicalType::INTEGER, LogicalType::HUGEINT));
 		function.SetStatisticsCallback(SumPropagateStats);
 		function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 		return function.SetStructStateExport(GetSumStateType<hugeint_t>);
 	}
 	case PhysicalType::INT64: {
-		auto function =
+		auto function = SetFORSumCallbacks<SumState<hugeint_t>, int64_t, SumToHugeintOperation, AddToHugeint>(
 		    AggregateFunction::UnaryAggregate<SumState<hugeint_t>, int64_t, hugeint_t, SumToHugeintOperation>(
-		        LogicalType::BIGINT, LogicalType::HUGEINT);
+		        LogicalType::BIGINT, LogicalType::HUGEINT));
 		function.SetStatisticsCallback(SumPropagateStats);
 		function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 		return function.SetStructStateExport(GetSumStateType<hugeint_t>);

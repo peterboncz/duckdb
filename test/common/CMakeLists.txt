@@ -5,6 +5,7 @@ add_library_unity(
   test_checksum.cpp
   test_file_buffer_handle_group.cpp
   test_file_system.cpp
+  test_for_vector.cpp
   test_caching_file_system_wrapper.cpp
   test_hyperlog.cpp
   test_lru_cache.cpp
