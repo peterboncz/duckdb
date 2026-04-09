@@ -1,6 +1,8 @@
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/scalar/compressed_materialization_functions.hpp"
 #include "duckdb/function/scalar/compressed_materialization_utils.hpp"
@@ -43,8 +45,42 @@ void IntegralCompressFunction(DataChunk &args, ExpressionState &state, Vector &r
 	D_ASSERT(args.ColumnCount() == 2);
 	D_ASSERT(args.data[1].GetVectorType() == VectorType::CONSTANT_VECTOR);
 	const auto min_val = ConstantVector::GetData<INPUT_TYPE>(args.data[1])[0];
+	auto &input_vec = args.data[0];
+	auto count = args.size();
+
+	// FOR vector fast path: operate on narrow stored data directly
+	const SelectionVector *dict_sel = nullptr;
+	auto *for_vec = FORVector::TryGetFOR(input_vec, dict_sel);
+	if (for_vec && !dict_sel) {
+		auto stored_type = FORVector::GetStoredType(*for_vec);
+		auto stored_size = GetTypeIdSize(stored_type);
+		auto result_size = GetTypeIdSize(result.GetType().InternalType());
+		auto src = FORVector::GetData(*for_vec);
+
+		if (stored_size <= result_size && min_val >= INPUT_TYPE(0) &&
+		    static_cast<uint64_t>(min_val) <= static_cast<uint64_t>(NumericLimits<RESULT_TYPE>::Maximum())) {
+			auto result_data = FlatVector::GetData<RESULT_TYPE>(result);
+			bool handled = FORVector::DispatchStoredType(stored_type, [&](auto tag) {
+				using STORED_T = typename decltype(tag)::type;
+				auto stored_data = reinterpret_cast<const STORED_T *>(src);
+				if (static_cast<uint64_t>(min_val) > static_cast<uint64_t>(NumericLimits<STORED_T>::Maximum())) {
+					return false; // min_val too large for narrow subtraction
+				}
+				auto min_narrow = static_cast<STORED_T>(min_val);
+				for (idx_t i = 0; i < count; i++) {
+					result_data[i] = UnsafeNumericCast<RESULT_TYPE>(stored_data[i] - min_narrow);
+				}
+				return true;
+			});
+			if (handled) {
+				FlatVector::Validity(result) = FORVector::Validity(*for_vec);
+				return;
+			}
+		}
+	}
+
 	UnaryExecutor::Execute<INPUT_TYPE, RESULT_TYPE>(
-	    args.data[0], result, args.size(),
+	    input_vec, result, count,
 	    [&](const INPUT_TYPE &input) {
 		    return TemplatedIntegralCompress<INPUT_TYPE, RESULT_TYPE>::Operation(input, min_val);
 	    },
@@ -133,6 +169,34 @@ void IntegralDecompressFunction(DataChunk &args, ExpressionState &state, Vector 
 	D_ASSERT(args.data[1].GetVectorType() == VectorType::CONSTANT_VECTOR);
 	D_ASSERT(args.data[1].GetType() == result.GetType());
 	const auto min_val = ConstantVector::GetData<RESULT_TYPE>(args.data[1])[0];
+	auto &input_vec = args.data[0];
+	auto count = args.size();
+
+	if (sizeof(RESULT_TYPE) > sizeof(INPUT_TYPE) && min_val >= RESULT_TYPE(0) && count > 1) {
+		auto input_phys = input_vec.GetType().InternalType();
+		// Only produce FOR if input is strictly narrower than result
+		if (GetTypeIdSize(input_phys) < sizeof(RESULT_TYPE)) {
+			auto max_value = TemplatedIntegralDecompress<INPUT_TYPE, RESULT_TYPE>::Operation(
+			    NumericLimits<INPUT_TYPE>::Maximum(), min_val);
+			PhysicalType stored_phys;
+			if (FORVector::TryGetStoredTypeForMax<RESULT_TYPE>(max_value, stored_phys)) {
+				input_vec.Flatten(count);
+				FORVector::Create<RESULT_TYPE>(result, stored_phys, max_value);
+				FORVector::Validity(result) = FlatVector::Validity(input_vec);
+				FORVector::DispatchStoredType(stored_phys, [&](auto tag) {
+					using STORED_T = typename decltype(tag)::type;
+					auto input_data = FlatVector::GetData<INPUT_TYPE>(input_vec);
+					auto result_data = reinterpret_cast<STORED_T *>(FORVector::GetData(result));
+					for (idx_t i = 0; i < count; i++) {
+						result_data[i] = UnsafeNumericCast<STORED_T>(
+						    TemplatedIntegralDecompress<INPUT_TYPE, RESULT_TYPE>::Operation(input_data[i], min_val));
+					}
+				});
+				return;
+			}
+		}
+	}
+
 	UnaryExecutor::Execute<INPUT_TYPE, RESULT_TYPE>(
 	    args.data[0], result, args.size(),
 	    [&](const INPUT_TYPE &input) {

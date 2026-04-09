@@ -2,6 +2,7 @@
 #include "duckdb/common/vector/constant_vector.hpp"
 #include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/common/vector/fsst_vector.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/vector/map_vector.hpp"
@@ -276,6 +277,14 @@ void Vector::Slice(const SelectionVector &sel, idx_t count) {
 		return;
 	}
 
+	if (GetVectorType() == VectorType::FOR_VECTOR) {
+		Vector child_vector(Vector::Ref(*this));
+		auto entry = make_shared_ptr<DictionaryEntry>(std::move(child_vector));
+		buffer = make_buffer<DictionaryBuffer>(sel, std::move(entry));
+		vector_type = VectorType::DICTIONARY_VECTOR;
+		return;
+	}
+
 	Vector child_vector(Vector::Ref(*this));
 	auto internal_type = GetType().InternalType();
 	if (internal_type == PhysicalType::STRUCT) {
@@ -488,6 +497,9 @@ void Vector::SetValue(idx_t index, const Value &val) {
 		auto &child = DictionaryVector::Child(*this);
 		return child.SetValue(sel_vector.get_index(index), val);
 	}
+	if (GetVectorType() == VectorType::FOR_VECTOR) {
+		Flatten(index + 1); // flatten first, then set value
+	}
 	if (!val.IsNull() && val.type() != GetType()) {
 		SetValue(index, val.DefaultCastAs(GetType()));
 		return;
@@ -665,6 +677,11 @@ Value Vector::GetValueInternal(const Vector &v_p, idx_t index_p) {
 			SequenceVector::GetSequence(current_vector, start, increment);
 			return Value::Numeric(current_vector.GetType(),
 			                      start + static_cast<int64_t>(static_cast<uint64_t>(increment) * index));
+		}
+		case VectorType::FOR_VECTOR: { // Flatten and get value
+			Vector copy(Vector::Ref(current_vector));
+			copy.Flatten(index + 1);
+			return copy.GetValue(index);
 		}
 		default:
 			throw InternalException("Unimplemented vector type for Vector::GetValue");
@@ -912,6 +929,8 @@ string VectorTypeToString(VectorType type) {
 		return "CONSTANT";
 	case VectorType::SHREDDED_VECTOR:
 		return "SHREDDED";
+	case VectorType::FOR_VECTOR:
+		return "FOR";
 	default:
 		return "UNKNOWN";
 	}
@@ -923,6 +942,7 @@ string Vector::ToString(idx_t count) const {
 	switch (GetVectorType()) {
 	case VectorType::FLAT_VECTOR:
 	case VectorType::DICTIONARY_VECTOR:
+	case VectorType::FOR_VECTOR:
 		for (idx_t i = 0; i < count; i++) {
 			retval += GetValue(i).ToString() + (i == count - 1 ? "" : ", ");
 		}
@@ -1110,6 +1130,13 @@ void Vector::Flatten(idx_t count) const {
 		ConstReference(flattened_vector);
 		break;
 	}
+	case VectorType::FOR_VECTOR: {
+		Vector flattened_vector(GetType(), MaxValue<idx_t>(STANDARD_VECTOR_SIZE, count));
+		FORVector::Decompress(*this, flattened_vector, count);
+		FlatVector::Validity(flattened_vector) = FORVector::Validity(*this);
+		ConstReference(flattened_vector);
+		break;
+	}
 	default:
 		throw InternalException("Unimplemented type for flatten");
 	}
@@ -1150,6 +1177,18 @@ void Vector::Flatten(const SelectionVector &sel, idx_t count) const {
 		ConstReference(flattened_vector);
 		break;
 	}
+	case VectorType::FOR_VECTOR: {
+		Vector flattened_vector(GetType(), MaxValue<idx_t>(STANDARD_VECTOR_SIZE, count));
+		FORVector::Decompress(*this, flattened_vector, sel, count);
+		// Remap validity: output[i] is valid iff source[sel[i]] was valid
+		auto &src_validity = FORVector::Validity(*this);
+		auto &dst_validity = FlatVector::Validity(flattened_vector);
+		for (idx_t i = 0; i < count; i++) {
+			dst_validity.Set(i, src_validity.RowIsValid(sel.get_index(i)));
+		}
+		ConstReference(flattened_vector);
+		break;
+	}
 	default:
 		throw InternalException("Unimplemented type for flatten with selection vector");
 	}
@@ -1168,17 +1207,16 @@ void Vector::ToUnifiedFormat(idx_t count, UnifiedVectorFormat &format) const {
 			format.data = FlatVector::GetData(child);
 			format.validity = FlatVector::Validity(child);
 		} else {
-			// dictionary with non-flat child: create a new reference to the child and flatten it
+			// dictionary with non-flat child (e.g. FOR): flatten fully so data stays indexed
+			// by original positions. Store in format.owned_data to keep alive WITHOUT modifying
+			// this->buffer — otherwise other expressions referencing the same input vector
+			// would see the flattened (FLAT) version instead of the original DICTIONARY(FOR).
 			Vector child_vector(Vector::Ref(child));
-			child_vector.Flatten(sel, count);
-			auto new_entry = make_buffer<DictionaryEntry>(std::move(child_vector));
-			auto &dict_entry = *new_entry;
-			auto &old_dict_buffer = this->buffer->Cast<DictionaryBuffer>();
-			auto new_dict_buffer = make_buffer<DictionaryBuffer>(old_dict_buffer.GetSelVector(), std::move(new_entry));
-			this->buffer = std::move(new_dict_buffer);
+			child_vector.Flatten(STANDARD_VECTOR_SIZE);
 
-			format.data = FlatVector::GetData(dict_entry.data);
-			format.validity = FlatVector::Validity(dict_entry.data);
+			format.owned_data = child_vector.buffer;
+			format.data = child_vector.buffer->GetData();
+			format.validity = child_vector.validity;
 		}
 		break;
 	}

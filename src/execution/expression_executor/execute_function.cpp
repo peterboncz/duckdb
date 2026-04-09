@@ -59,6 +59,10 @@ bool ExecuteFunctionState::TryExecuteDictionaryExpression(const BoundFunctionExp
 	if (unary_input.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 		return false; // Not a dictionary
 	}
+	// Skip dictionary optimization for DICTIONARY(FOR) — let the function handle FOR directly
+	if (DictionaryVector::Child(unary_input).GetVectorType() == VectorType::FOR_VECTOR) {
+		return false;
+	}
 
 	const auto input_dictionary_size_opt = DictionaryVector::DictionarySize(unary_input);
 	const auto &input_dictionary_id = DictionaryVector::DictionaryId(unary_input);

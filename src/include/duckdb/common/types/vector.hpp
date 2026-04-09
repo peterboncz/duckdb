@@ -42,6 +42,7 @@ class Vector {
 	friend struct SequenceVector;
 	friend struct ArrayVector;
 	friend struct ShreddedVector;
+	friend struct FORVector;
 
 	friend class DataChunk;
 	friend class VectorCacheEntry;

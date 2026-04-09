@@ -1,5 +1,6 @@
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/cast/vector_cast_helpers.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 
 #include "duckdb/common/vector_operations/general_cast.hpp"
 #include "duckdb/common/types/decimal.hpp"
@@ -190,6 +191,10 @@ static bool DecimalDecimalCastSwitch(Vector &source, Vector &result, idx_t count
 	auto result_scale = DecimalType::GetScale(result.GetType());
 	source.GetType().Verify();
 	result.GetType().Verify();
+
+	if (result_scale == source_scale && FORVector::TryWidenType(source, result)) {
+		return true;
+	}
 
 	// we need to either multiply or divide by the difference in scales
 	if (result_scale >= source_scale) {

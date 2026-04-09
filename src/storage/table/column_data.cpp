@@ -3,9 +3,13 @@
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/function/compression_function.hpp"
 #include "duckdb/function/variant/variant_shredding.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_state.hpp"
 #include "duckdb/storage/data_pointer.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/column_data_checkpointer.hpp"
@@ -347,11 +351,81 @@ idx_t ColumnData::ScanCount(ColumnScanState &state, Vector &result, idx_t scan_c
 	return ScanVector(state, result, scan_count, ScanVectorType::SCAN_FLAT_VECTOR, result_offset);
 }
 
+//===--------------------------------------------------------------------===//
+// FOR Vector Filter Pushdown
+//===--------------------------------------------------------------------===//
+// Attempt to evaluate a TableFilter directly on a FOR vector's narrow stored data.
+// Returns true if handled, false to fall through to the generic path.
+static bool TryFORFilter(Vector &result, idx_t scan_count, SelectionVector &sel, idx_t &approved_tuple_count,
+                         const TableFilter &filter, TableFilterState &filter_state);
+
+template <class OP>
+static bool TryFORConstantFilter(Vector &result, idx_t scan_count, SelectionVector &sel, idx_t &count,
+                                 const ConstantFilter &cf, TableFilterState &fs) {
+	Vector cv(cf.constant);
+	return FORVector::TryExecuteComparisonConstant<OP>(
+	    result, cv, [&](Vector &) { count = 0; },
+	    [&](Vector &, bool cmp) {
+		    if (!cmp)
+			    count = 0;
+	    },
+	    [&](Vector &fv, bool, auto, auto ac) {
+		    auto sv = FORVector::CreateStoredView(fv);
+		    ConstantFilter adj(cf.comparison_type, Value::CreateValue(ac));
+		    UnifiedVectorFormat vd;
+		    sv.ToUnifiedFormat(scan_count, vd);
+		    ColumnSegment::FilterSelection(sel, sv, vd, adj, fs, scan_count, count);
+	    });
+}
+static bool TryFORFilter(Vector &result, idx_t scan_count, SelectionVector &sel, idx_t &count,
+                         const TableFilter &filter, TableFilterState &fs) {
+	if (result.GetVectorType() != VectorType::FOR_VECTOR)
+		return false;
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &cf = filter.Cast<ConstantFilter>();
+		switch (cf.comparison_type) {
+		case ExpressionType::COMPARE_EQUAL:
+			return TryFORConstantFilter<Equals>(result, scan_count, sel, count, cf, fs);
+		case ExpressionType::COMPARE_NOTEQUAL:
+			return TryFORConstantFilter<NotEquals>(result, scan_count, sel, count, cf, fs);
+		case ExpressionType::COMPARE_GREATERTHAN:
+			return TryFORConstantFilter<GreaterThan>(result, scan_count, sel, count, cf, fs);
+		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+			return TryFORConstantFilter<GreaterThanEquals>(result, scan_count, sel, count, cf, fs);
+		case ExpressionType::COMPARE_LESSTHAN:
+			return TryFORConstantFilter<LessThan>(result, scan_count, sel, count, cf, fs);
+		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+			return TryFORConstantFilter<LessThanEquals>(result, scan_count, sel, count, cf, fs);
+		default:
+			return false;
+		}
+	}
+	case TableFilterType::CONJUNCTION_AND: {
+		auto &conj = filter.Cast<ConjunctionAndFilter>();
+		auto &st = fs.Cast<ConjunctionAndFilterState>();
+		for (idx_t i = 0; i < conj.child_filters.size(); i++)
+			if (!TryFORFilter(result, scan_count, sel, count, *conj.child_filters[i], *st.child_states[i]))
+				return false;
+		return true;
+	}
+	case TableFilterType::IS_NULL:
+	case TableFilterType::IS_NOT_NULL: {
+		UnifiedVectorFormat vd;
+		result.ToUnifiedFormat(scan_count, vd);
+		ColumnSegment::FilterSelection(sel, result, vd, filter, fs, scan_count, count);
+		return true;
+	}
+	default:
+		return false;
+	}
+}
 void ColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
                         SelectionVector &sel, idx_t &s_count, const TableFilter &filter,
                         TableFilterState &filter_state) {
 	idx_t scan_count = Scan(transaction, vector_index, state, result);
-
+	if (TryFORFilter(result, scan_count, sel, s_count, filter, filter_state))
+		return;
 	UnifiedVectorFormat vdata;
 	result.ToUnifiedFormat(scan_count, vdata);
 	ColumnSegment::FilterSelection(sel, result, vdata, filter, filter_state, scan_count, s_count);

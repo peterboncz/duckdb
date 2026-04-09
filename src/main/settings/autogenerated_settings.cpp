@@ -153,6 +153,23 @@ void ExplainOutputSetting::OnSet(SettingCallbackInfo &info, Value &parameter) {
 }
 
 //===----------------------------------------------------------------------===//
+// For Vectors
+//===----------------------------------------------------------------------===//
+void ForVectorsSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto &config = ClientConfig::GetConfig(context);
+	config.for_vectors = input.GetValue<bool>();
+}
+
+void ForVectorsSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).for_vectors = ClientConfig().for_vectors;
+}
+
+Value ForVectorsSetting::GetSetting(const ClientContext &context) {
+	auto &config = ClientConfig::GetConfig(context);
+	return Value::BOOLEAN(config.for_vectors);
+}
+
+//===----------------------------------------------------------------------===//
 // Force Bitpacking Mode
 //===----------------------------------------------------------------------===//
 void ForceBitpackingModeSetting::OnSet(SettingCallbackInfo &info, Value &parameter) {

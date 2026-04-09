@@ -925,6 +925,17 @@ struct FileSearchPathSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct ForVectorsSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "for_vectors";
+	static constexpr const char *Description =
+	    "Enable FOR (Frame of Reference) compressed vectors in scans and compressed materialization";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct ForceBitpackingModeSetting {
 	using RETURN_TYPE = BitpackingMode;
 	static constexpr const char *Name = "force_bitpacking_mode";

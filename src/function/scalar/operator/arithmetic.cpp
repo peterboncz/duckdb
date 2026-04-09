@@ -15,6 +15,9 @@
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/vector/constant_vector.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
+#include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/function/scalar/operators.hpp"
 #include "duckdb/function/scalar/operator_functions.hpp"
 #include "duckdb/function/scalar/string_functions.hpp"
@@ -62,6 +65,68 @@ static scalar_function_t GetScalarIntegerFunction(PhysicalType type) {
 		throw NotImplementedException("Unimplemented type for GetScalarBinaryFunction: %s", TypeIdToString(type));
 	}
 	return function;
+}
+
+template <class OP>
+struct FORBoundsSelector;
+template <>
+struct FORBoundsSelector<AddOperator> {
+	template <class T>
+	static bool Operation(T l, T r, T &out) {
+		return TryAddOperator::Operation(l, r, out);
+	}
+};
+template <>
+struct FORBoundsSelector<AddOperatorOverflowCheck> : FORBoundsSelector<AddOperator> {};
+template <>
+struct FORBoundsSelector<DecimalAddOverflowCheck> : FORBoundsSelector<AddOperator> {};
+template <>
+struct FORBoundsSelector<SubtractOperator> {
+	template <class T>
+	static bool Operation(T l, T r, T &out) {
+		return r > l ? false : (out = l, true);
+	}
+};
+template <>
+struct FORBoundsSelector<SubtractOperatorOverflowCheck> : FORBoundsSelector<SubtractOperator> {};
+template <>
+struct FORBoundsSelector<DecimalSubtractOverflowCheck> : FORBoundsSelector<SubtractOperator> {};
+template <>
+struct FORBoundsSelector<MultiplyOperator> {
+	template <class T>
+	static bool Operation(T l, T r, T &out) {
+		return TryMultiplyOperator::Operation(l, r, out);
+	}
+};
+template <>
+struct FORBoundsSelector<MultiplyOperatorOverflowCheck> : FORBoundsSelector<MultiplyOperator> {};
+template <>
+struct FORBoundsSelector<DecimalMultiplyOverflowCheck> : FORBoundsSelector<MultiplyOperator> {};
+
+template <class DOMAIN_T, class OP>
+static void FORArithmeticDomainFunction(DataChunk &input, ExpressionState &state, Vector &result) {
+	if (TryFORArithmetic<DOMAIN_T, OP, FORBoundsSelector<OP>>(input.data[0], input.data[1], result, input.size()))
+		return;
+	GetScalarIntegerFunction<OP>(input.data[0].GetType().InternalType())(input, state, result);
+}
+
+template <class OP>
+static scalar_function_t GetFORArithmeticFunction(PhysicalType type) {
+	if (!TypeIsIntegral(type) || GetTypeIdSize(type) <= 1) {
+		return GetScalarIntegerFunction<OP>(type);
+	}
+	switch (GetTypeIdSize(type)) {
+	case sizeof(uint16_t):
+		return &FORArithmeticDomainFunction<uint16_t, OP>;
+	case sizeof(uint32_t):
+		return &FORArithmeticDomainFunction<uint32_t, OP>;
+	case sizeof(uint64_t):
+		return &FORArithmeticDomainFunction<uint64_t, OP>;
+	case sizeof(uhugeint_t):
+		return &FORArithmeticDomainFunction<uhugeint_t, OP>;
+	default:
+		return GetScalarIntegerFunction<OP>(type);
+	}
 }
 
 template <class OP>
@@ -181,7 +246,7 @@ unique_ptr<BaseStatistics> PropagateNumericStats(ClientContext &context, Functio
 			auto &bind_data = input.bind_data->Cast<DecimalArithmeticBindData>();
 			bind_data.check_overflow = false;
 		}
-		expr.function.SetFunctionCallback(GetScalarIntegerFunction<BASEOP>(expr.return_type.InternalType()));
+		expr.function.SetFunctionCallback(GetFORArithmeticFunction<BASEOP>(expr.return_type.InternalType()));
 	}
 	auto result = NumericStats::CreateEmpty(expr.return_type);
 	NumericStats::SetMin(result, new_min);
@@ -253,9 +318,9 @@ unique_ptr<FunctionData> BindDecimalAddSubtract(ClientContext &context, ScalarFu
 	// now select the physical function to execute
 	auto &result_type = bound_function.GetReturnType();
 	if (bind_data->check_overflow) {
-		bound_function.SetFunctionCallback(GetScalarBinaryFunction<OPOVERFLOWCHECK>(result_type.InternalType()));
+		bound_function.SetFunctionCallback(GetFORArithmeticFunction<OPOVERFLOWCHECK>(result_type.InternalType()));
 	} else {
-		bound_function.SetFunctionCallback(GetScalarBinaryFunction<OP>(result_type.InternalType()));
+		bound_function.SetFunctionCallback(GetFORArithmeticFunction<OP>(result_type.InternalType()));
 	}
 	if (result_type.InternalType() != PhysicalType::INT128 && result_type.InternalType() != PhysicalType::UINT128) {
 		if (IS_SUBTRACT) {
@@ -361,7 +426,7 @@ ScalarFunction AddFunction::GetFunction(const LogicalType &left_type, const Logi
 			return function;
 		} else if (left_type.IsIntegral()) {
 			ScalarFunction function("+", {left_type, right_type}, left_type,
-			                        GetScalarIntegerFunction<AddOperatorOverflowCheck>(left_type.InternalType()),
+			                        GetFORArithmeticFunction<AddOperatorOverflowCheck>(left_type.InternalType()),
 			                        nullptr, nullptr,
 			                        PropagateNumericStats<TryAddOperator, AddPropagateStatistics, AddOperator>);
 			function.SetFallible();
@@ -714,7 +779,7 @@ ScalarFunction SubtractFunction::GetFunction(const LogicalType &left_type, const
 		} else if (left_type.IsIntegral()) {
 			ScalarFunction function(
 			    "-", {left_type, right_type}, left_type,
-			    GetScalarIntegerFunction<SubtractOperatorOverflowCheck>(left_type.InternalType()), nullptr, nullptr,
+			    GetFORArithmeticFunction<SubtractOperatorOverflowCheck>(left_type.InternalType()), nullptr, nullptr,
 			    PropagateNumericStats<TrySubtractOperator, SubtractPropagateStatistics, SubtractOperator>);
 			function.SetFallible();
 			return function;
@@ -931,9 +996,9 @@ unique_ptr<FunctionData> BindDecimalMultiply(ClientContext &context, ScalarFunct
 	// now select the physical function to execute
 	if (bind_data->check_overflow) {
 		bound_function.SetFunctionCallback(
-		    GetScalarBinaryFunction<DecimalMultiplyOverflowCheck>(result_type.InternalType()));
+		    GetFORArithmeticFunction<DecimalMultiplyOverflowCheck>(result_type.InternalType()));
 	} else {
-		bound_function.SetFunctionCallback(GetScalarBinaryFunction<MultiplyOperator>(result_type.InternalType()));
+		bound_function.SetFunctionCallback(GetFORArithmeticFunction<MultiplyOperator>(result_type.InternalType()));
 	}
 	if (result_type.InternalType() != PhysicalType::INT128) {
 		bound_function.SetStatisticsCallback(
@@ -955,7 +1020,7 @@ ScalarFunctionSet OperatorMultiplyFun::GetFunctions() {
 			multiply.AddFunction(function);
 		} else if (TypeIsIntegral(type.InternalType())) {
 			multiply.AddFunction(ScalarFunction(
-			    {type, type}, type, GetScalarIntegerFunction<MultiplyOperatorOverflowCheck>(type.InternalType()),
+			    {type, type}, type, GetFORArithmeticFunction<MultiplyOperatorOverflowCheck>(type.InternalType()),
 			    nullptr, nullptr,
 			    PropagateNumericStats<TryMultiplyOperator, MultiplyPropagateStatistics, MultiplyOperator>));
 		} else {

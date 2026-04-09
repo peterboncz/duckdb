@@ -10,6 +10,7 @@
 #include "duckdb/common/types/sel_cache.hpp"
 #include "duckdb/common/types/vector_cache.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/execution_context.hpp"
 
@@ -222,7 +223,17 @@ void DataChunk::Append(const DataChunk &other, bool resize, SelectionVector *sel
 		}
 	}
 	for (idx_t i = 0; i < ColumnCount(); i++) {
-		D_ASSERT(data[i].GetVectorType() == VectorType::FLAT_VECTOR);
+		// Convert empty FLAT target to FOR when source is FOR (for compaction preservation)
+		auto &src = other.data[i];
+		if (size() == 0 && src.GetVectorType() == VectorType::FOR_VECTOR &&
+		    data[i].GetVectorType() != VectorType::FOR_VECTOR) {
+			data[i].SetVectorType(VectorType::FOR_VECTOR);
+			auto st = FORVector::GetStoredType(src);
+			FORVector::DispatchLogicalType(src.GetType().InternalType(), [&](auto tag) {
+				using T = typename decltype(tag)::type;
+				FORVector::SetMetadata<T>(data[i], st, FORVector::GetMax<T>(src));
+			});
+		}
 		if (sel) {
 			VectorOperations::Copy(other.data[i], data[i], *sel, sel_count, 0, size());
 		} else {

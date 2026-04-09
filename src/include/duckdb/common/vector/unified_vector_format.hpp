@@ -33,6 +33,9 @@ struct UnifiedVectorFormat {
 	ValidityMask validity;
 	SelectionVector owned_sel;
 	PhysicalType physical_type;
+	//! Holds flattened data for non-flat dictionary children (e.g. FOR vectors),
+	//! keeping it alive without modifying the source vector.
+	buffer_ptr<VectorBuffer> owned_data;
 
 	template <class T>
 	void VerifyVectorType() const {

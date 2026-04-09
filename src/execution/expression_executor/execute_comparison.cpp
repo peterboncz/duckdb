@@ -4,6 +4,8 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/common/vector_operations/binary_executor.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 
 #include <algorithm>
 
@@ -79,6 +81,31 @@ static idx_t NestedSelectOperation(Vector &left, Vector &right, optional_ptr<con
                                    optional_ptr<SelectionVector> true_sel, optional_ptr<SelectionVector> false_sel,
                                    optional_ptr<ValidityMask> null_mask);
 
+//===--------------------------------------------------------------------===//
+static idx_t FORSelectAll(optional_ptr<const SelectionVector> sel, idx_t count, optional_ptr<SelectionVector> true_sel,
+                          optional_ptr<SelectionVector> false_sel, bool pass) {
+	if (auto &t = pass ? true_sel : false_sel)
+		for (idx_t i = 0; i < count; i++)
+			t->set_index(i, sel ? sel->get_index(i) : i);
+	return pass ? count : 0;
+}
+template <class OP>
+static int64_t TryFORConstantSelect(Vector &left, Vector &right, optional_ptr<const SelectionVector> sel, idx_t count,
+                                    optional_ptr<SelectionVector> true_sel, optional_ptr<SelectionVector> false_sel) {
+	int64_t rv = -1;
+	auto ok = FORVector::TryExecuteComparisonConstant<OP>(
+	    left, right, [&](Vector &) { rv = NumericCast<int64_t>(FORSelectAll(sel, count, true_sel, false_sel, false)); },
+	    [&](Vector &, bool cmp) { rv = NumericCast<int64_t>(FORSelectAll(sel, count, true_sel, false_sel, cmp)); },
+	    [&](Vector &fv, bool for_is_right, auto tag, auto ac) {
+		    using S = typename decltype(tag)::type;
+		    auto sv = FORVector::CreateStoredView(fv);
+		    Vector cv(Value::CreateValue(ac));
+		    auto &l = for_is_right ? cv : sv, &r = for_is_right ? sv : cv;
+		    rv = NumericCast<int64_t>(
+		        BinaryExecutor::Select<S, S, OP>(l, r, sel.get(), count, true_sel.get(), false_sel.get()));
+	    });
+	return ok ? rv : -1;
+}
 template <class OP>
 static idx_t TemplatedSelectOperation(Vector &left, Vector &right, optional_ptr<const SelectionVector> sel, idx_t count,
                                       optional_ptr<SelectionVector> true_sel, optional_ptr<SelectionVector> false_sel,
@@ -87,6 +114,9 @@ static idx_t TemplatedSelectOperation(Vector &left, Vector &right, optional_ptr<
 		UpdateNullMask(left, sel, count, *null_mask);
 		UpdateNullMask(right, sel, count, *null_mask);
 	}
+	auto fr = TryFORConstantSelect<OP>(left, right, sel, count, true_sel, false_sel);
+	if (fr >= 0)
+		return NumericCast<idx_t>(fr);
 	switch (left.GetType().InternalType()) {
 	case PhysicalType::BOOL:
 	case PhysicalType::INT8:

@@ -7,6 +7,10 @@
 #include "duckdb/common/operator/comparison_operators.hpp"
 
 #include "duckdb/common/uhugeint.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
+#include "duckdb/common/vector/constant_vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 
@@ -214,6 +218,23 @@ static void NestedComparisonExecutor(Vector &left, Vector &right, Vector &result
 
 struct ComparisonExecutor {
 private:
+	template <class OP>
+	static bool TryExecuteFORConstant(Vector &left, Vector &right, Vector &result, idx_t count) {
+		return FORVector::TryExecuteComparisonConstant<OP>(
+		    left, right, [&](Vector &) { ConstantVector::SetNull(result); },
+		    [&](Vector &fv, bool cmp) {
+			    result.SetVectorType(VectorType::FLAT_VECTOR);
+			    memset(FlatVector::GetData(result), cmp ? 1 : 0, count);
+			    FlatVector::Validity(result) = FORVector::Validity(fv);
+		    },
+		    [&](Vector &fv, bool for_is_right, auto tag, auto ac) {
+			    using S = typename decltype(tag)::type;
+			    auto sv = FORVector::CreateStoredView(fv);
+			    Vector cv(Value::CreateValue(ac));
+			    auto &l = for_is_right ? cv : sv, &r = for_is_right ? sv : cv;
+			    BinaryExecutor::Execute<S, S, bool, OP>(l, r, result, count);
+		    });
+	}
 	template <class T, class OP>
 	static inline void TemplatedExecute(Vector &left, Vector &right, Vector &result, idx_t count) {
 		BinaryExecutor::Execute<T, T, bool, OP>(left, right, result, count);
@@ -224,6 +245,8 @@ public:
 	static inline void Execute(Vector &left, Vector &right, Vector &result, idx_t count) {
 		D_ASSERT(left.GetType().InternalType() == right.GetType().InternalType() &&
 		         result.GetType() == LogicalType::BOOLEAN);
+		if (TryExecuteFORConstant<OP>(left, right, result, count))
+			return;
 		// the inplace loops take the result as the last parameter
 		switch (left.GetType().InternalType()) {
 		case PhysicalType::BOOL:

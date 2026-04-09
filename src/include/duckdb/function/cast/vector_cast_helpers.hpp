@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/function/cast/default_casts.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/common/vector_operations/general_cast.hpp"
 #include "duckdb/common/operator/decimal_cast_operators.hpp"
@@ -166,6 +167,9 @@ struct VectorCastHelpers {
 		auto &result_type = result.GetType();
 		auto width = DecimalType::GetWidth(result_type);
 		auto scale = DecimalType::GetScale(result_type);
+		if (scale == 0 && FORVector::TryWidenType(source, result)) {
+			return true;
+		}
 		switch (result_type.InternalType()) {
 		case PhysicalType::INT16:
 			return TemplatedDecimalCast<T, int16_t, TryCastToDecimal>(source, result, count, parameters, width, scale);

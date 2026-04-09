@@ -6,8 +6,10 @@
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/operator/multiply.hpp"
 #include "duckdb/common/operator/subtract.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/function/compression/compression.hpp"
 #include "duckdb/function/compression_function.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
@@ -763,6 +765,31 @@ unique_ptr<SegmentScanState> BitpackingInitScan(const QueryContext &context, Col
 	return std::move(result);
 }
 
+template <class T>
+static void DecodeFORBlock(BitpackingScanState<T> &scan_state, idx_t group_offset, idx_t offset_in_compression_group,
+                           idx_t to_scan, T *result_ptr, bool apply_frame) {
+	//! Because FOR offsets all our values to be 0 or above, we can always skip sign extension here
+	bool skip_sign_extend = true;
+
+	data_ptr_t current_position_ptr = scan_state.current_group_ptr + group_offset * scan_state.current_width / 8;
+	data_ptr_t decompression_group_start_pointer =
+	    current_position_ptr - offset_in_compression_group * scan_state.current_width / 8;
+
+	if (to_scan == BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE && offset_in_compression_group == 0) {
+		BitpackingPrimitives::UnPackBlock<T>(data_ptr_cast(result_ptr), decompression_group_start_pointer,
+		                                     scan_state.current_width, skip_sign_extend);
+	} else {
+		BitpackingPrimitives::UnPackBlock<T>(data_ptr_cast(scan_state.decompression_buffer),
+		                                     decompression_group_start_pointer, scan_state.current_width,
+		                                     skip_sign_extend);
+		memcpy(result_ptr, scan_state.decompression_buffer + offset_in_compression_group, to_scan * sizeof(T));
+	}
+
+	if (apply_frame) {
+		ApplyFrameOfReference<T>(result_ptr, scan_state.current_frame_of_reference, to_scan);
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // Scan base data
 //===--------------------------------------------------------------------===//
@@ -773,9 +800,6 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 
 	T *result_data = FlatVector::GetData<T>(result);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-
-	//! Because FOR offsets all our values to be 0 or above, we can always skip sign extension here
-	bool skip_sign_extend = true;
 
 	idx_t scanned = 0;
 	while (scanned < scan_count) {
@@ -820,36 +844,19 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 
 		idx_t to_scan = MinValue<idx_t>(scan_count - scanned, BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE -
 		                                                          offset_in_compression_group);
-		// Calculate start of compression algorithm group
-		data_ptr_t current_position_ptr =
-		    scan_state.current_group_ptr + scan_state.current_group_offset * scan_state.current_width / 8;
-		data_ptr_t decompression_group_start_pointer =
-		    current_position_ptr - offset_in_compression_group * scan_state.current_width / 8;
-
 		T *current_result_ptr = result_data + result_offset + scanned;
 
-		if (to_scan == BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE && offset_in_compression_group == 0) {
-			// Decompress directly into result vector
-			BitpackingPrimitives::UnPackBlock<T>(data_ptr_cast(current_result_ptr), decompression_group_start_pointer,
-			                                     scan_state.current_width, skip_sign_extend);
-		} else {
-			// Decompress compression algorithm to buffer
-			BitpackingPrimitives::UnPackBlock<T>(data_ptr_cast(scan_state.decompression_buffer),
-			                                     decompression_group_start_pointer, scan_state.current_width,
-			                                     skip_sign_extend);
-
-			memcpy(current_result_ptr, scan_state.decompression_buffer + offset_in_compression_group,
-			       to_scan * sizeof(T));
-		}
-
 		if (scan_state.current_group.mode == BitpackingMode::DELTA_FOR) {
+			DecodeFORBlock(scan_state, scan_state.current_group_offset, offset_in_compression_group, to_scan,
+			               current_result_ptr, false);
 			ApplyFrameOfReference<T_S>(reinterpret_cast<T_S *>(current_result_ptr),
 			                           static_cast<T_S>(scan_state.current_frame_of_reference), to_scan);
 			DeltaDecode<T_S>(reinterpret_cast<T_S *>(current_result_ptr),
 			                 static_cast<T_S>(scan_state.current_delta_offset), to_scan);
 			scan_state.current_delta_offset = current_result_ptr[to_scan - 1];
 		} else {
-			ApplyFrameOfReference<T>(current_result_ptr, scan_state.current_frame_of_reference, to_scan);
+			DecodeFORBlock(scan_state, scan_state.current_group_offset, offset_in_compression_group, to_scan,
+			               current_result_ptr, true);
 		}
 
 		scanned += to_scan;
@@ -857,8 +864,42 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 	}
 }
 
+// Produce a FOR vector from a bitpacking FOR scan by decoding actual values,
+// then narrowing them into the smallest unsigned FOR payload that fits.
+template <class T>
+bool TryBitpackingScanFOR(ColumnScanState &state, idx_t scan_count, Vector &result) {
+	if (sizeof(T) <= 1) {
+		return false;
+	}
+	auto client = state.context.GetClientContext();
+	if (client && !ClientConfig::GetConfig(*client).for_vectors) {
+		return false;
+	}
+
+	auto &scan_state = state.scan_state->Cast<BitpackingScanState<T>>();
+
+	if (scan_state.current_group_offset != 0 || scan_count > BITPACKING_METADATA_GROUP_SIZE ||
+	    scan_state.current_group.mode != BitpackingMode::FOR) {
+		return false;
+	}
+
+	T decoded[STANDARD_VECTOR_SIZE];
+	for (idx_t scanned = 0; scanned < scan_count; scanned += BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE) {
+		idx_t n = MinValue<idx_t>(scan_count - scanned, BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE);
+		DecodeFORBlock(scan_state, scanned, 0, n, decoded + scanned, true);
+	}
+	if (!FORVector::TryCreateFromArray<T>(decoded, scan_count, result)) {
+		return false;
+	}
+	scan_state.current_group_offset += scan_count;
+	return true;
+}
+
 template <class T>
 void BitpackingScan(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result) {
+	if (TryBitpackingScanFOR<T>(state, scan_count, result)) {
+		return;
+	}
 	BitpackingScanPartial<T>(segment, state, scan_count, result, 0);
 }
 

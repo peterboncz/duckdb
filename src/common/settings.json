@@ -618,6 +618,13 @@
         "default_value": ""
     },
     {
+        "name": "for_vectors",
+        "description": "Enable FOR (Frame of Reference) compressed vectors in scans and compressed materialization",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "internal_setting": "for_vectors"
+    },
+    {
         "name": "force_bitpacking_mode",
         "description": "DEBUG SETTING: forces a specific bitpacking mode",
         "type": "ENUM<BitpackingMode>",

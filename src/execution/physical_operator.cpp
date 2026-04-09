@@ -1,5 +1,6 @@
 #include "duckdb/execution/physical_operator.hpp"
 
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/render_tree.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -438,7 +439,25 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 		}
 	}
 
-	const auto execution_mode = SelectExecutionMode(chunk, child_result, state, context.client);
+	auto execution_mode = SelectExecutionMode(chunk, child_result, state, context.client);
+
+	// Flush cache when FOR-ness of new chunk doesn't match cached chunk (either direction)
+	// to prevent narrow/wide buffer corruption during append
+	if ((execution_mode == CachingPhysicalOperatorExecuteMode::APPEND_CHUNK ||
+	     execution_mode == CachingPhysicalOperatorExecuteMode::RETURN_CACHED_PLUS_CHUNK) &&
+	    state.cached_chunk && state.cached_chunk->size() > 0) {
+		for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+			auto &src = chunk.data[i];
+			bool src_for = src.GetVectorType() == VectorType::FOR_VECTOR ||
+			               (src.GetVectorType() == VectorType::DICTIONARY_VECTOR &&
+			                DictionaryVector::Child(src).GetVectorType() == VectorType::FOR_VECTOR);
+			bool tgt_for = state.cached_chunk->data[i].GetVectorType() == VectorType::FOR_VECTOR;
+			if (src_for != tgt_for) {
+				execution_mode = CachingPhysicalOperatorExecuteMode::RETURN_CACHED_APPEND_CHUNK;
+				break;
+			}
+		}
+	}
 
 	switch (execution_mode) {
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED_APPEND_CHUNK: {

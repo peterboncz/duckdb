@@ -8,6 +8,7 @@
 #include "duckdb/common/vector/constant_vector.hpp"
 #include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/common/vector/fsst_vector.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/vector/sequence_vector.hpp"
@@ -34,12 +35,25 @@ void TemplatedCopy(const Vector &source, const SelectionVector &sel, Vector &tar
 		tdata[target_offset + i] = ldata[source_idx];
 	}
 }
+
+template <class T>
+void TemplatedFORCopy(const Vector &source, const SelectionVector &sel, Vector &target, idx_t source_offset,
+                      idx_t target_offset, idx_t copy_count) {
+	auto ldata = reinterpret_cast<const T *>(FORVector::GetData(source));
+	auto tdata = reinterpret_cast<T *>(FORVector::GetData(target));
+	for (idx_t i = 0; i < copy_count; i++) {
+		auto source_idx = sel.get_index(source_offset + i);
+		tdata[target_offset + i] = ldata[source_idx];
+	}
+}
 } // namespace
 
 static const ValidityMask &ExtractValidityMask(const Vector &v) {
 	switch (v.GetVectorType()) {
 	case VectorType::FLAT_VECTOR:
 		return FlatVector::Validity(v);
+	case VectorType::FOR_VECTOR:
+		return FORVector::Validity(v);
 	case VectorType::FSST_VECTOR:
 		return FSSTVector::Validity(v);
 	default:
@@ -90,6 +104,25 @@ void VectorOperations::Copy(const Vector &source_p, Vector &target, const Select
 			Copy(shredded_vector, target, *sel, source_count, source_offset, target_offset, copy_count);
 			return;
 		}
+		case VectorType::FOR_VECTOR: {
+			auto st = FORVector::GetStoredType(*source);
+			if (target.GetVectorType() == VectorType::FOR_VECTOR && FORVector::GetStoredType(target) == st) {
+				FORVector::DispatchLogicalType(source->GetType().InternalType(), [&](auto tag) {
+					using T = typename decltype(tag)::type;
+					auto m = FORVector::GetMax<T>(*source);
+					if (target_offset == 0 || m > FORVector::GetMax<T>(target)) {
+						FORVector::SetMetadata<T>(target, st, m);
+					}
+				});
+				finished = true;
+				break;
+			}
+			Vector flat(source->GetType());
+			flat.Reference(*source);
+			flat.Flatten(STANDARD_VECTOR_SIZE);
+			Copy(flat, target, *sel, source_count, source_offset, target_offset, copy_count);
+			return;
+		}
 		case VectorType::FSST_VECTOR:
 		case VectorType::FLAT_VECTOR:
 			finished = true;
@@ -109,10 +142,16 @@ void VectorOperations::Copy(const Vector &source_p, Vector &target, const Select
 		target_offset = 0;
 		target.SetVectorType(VectorType::FLAT_VECTOR);
 	}
-	D_ASSERT(target.GetVectorType() == VectorType::FLAT_VECTOR);
+	// Non-FOR source into FOR target: decompress target to prevent narrow buffer corruption
+	if (target.GetVectorType() == VectorType::FOR_VECTOR && source->GetVectorType() != VectorType::FOR_VECTOR) {
+		target.Flatten(target_offset);
+	}
+	D_ASSERT(target.GetVectorType() == VectorType::FLAT_VECTOR || target.GetVectorType() == VectorType::FOR_VECTOR);
+	D_ASSERT(sel);
 
 	// first copy the nullmask
-	auto &tmask = FlatVector::Validity(target);
+	auto &tmask =
+	    target.GetVectorType() == VectorType::FOR_VECTOR ? FORVector::Validity(target) : FlatVector::Validity(target);
 	if (source->GetVectorType() == VectorType::CONSTANT_VECTOR) {
 		const bool valid = !ConstantVector::IsNull(*source);
 		for (idx_t i = 0; i < copy_count; i++) {
@@ -122,12 +161,18 @@ void VectorOperations::Copy(const Vector &source_p, Vector &target, const Select
 		auto &smask = ExtractValidityMask(*source);
 		tmask.CopySel(smask, *sel, source_offset, target_offset, copy_count);
 	}
-
-	D_ASSERT(sel);
-
 	// For FSST Vectors we decompress instead of copying.
 	if (source->GetVectorType() == VectorType::FSST_VECTOR) {
 		FSSTVector::DecompressVector(*source, target, source_offset, target_offset, copy_count, sel);
+		return;
+	}
+	if (source->GetVectorType() == VectorType::FOR_VECTOR) {
+		D_ASSERT(target.GetVectorType() == VectorType::FOR_VECTOR);
+		FORVector::DispatchStoredType(FORVector::GetStoredType(*source), [&](auto tag) {
+			using STORED_T = typename decltype(tag)::type;
+			TemplatedFORCopy<STORED_T>(*source, *sel, target, source_offset, target_offset, copy_count);
+			return true;
+		});
 		return;
 	}
 

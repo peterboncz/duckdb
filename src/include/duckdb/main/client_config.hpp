@@ -74,6 +74,8 @@ struct ClientConfig {
 	bool verify_parallelism = false;
 	//! Force out-of-core computation for operators that support it, used for testing
 	bool force_external = false;
+	//! Enable FOR (Frame of Reference) compressed vectors in scans and compressed materialization
+	bool for_vectors = true;
 	//! Force use of fetch row instead of scan, used for testing
 	bool force_fetch_row = false;
 	//! If this context should also try to use the available replacement scans
