@@ -90,9 +90,16 @@ static idx_t FORSelectAll(optional_ptr<const SelectionVector> sel, idx_t count, 
 	return pass ? count : 0;
 }
 template <class OP>
-static int64_t TryFORConstantSelect(Vector &left, Vector &right, optional_ptr<const SelectionVector> sel, idx_t count,
-                                    optional_ptr<SelectionVector> true_sel, optional_ptr<SelectionVector> false_sel) {
+static int64_t TryFORSelect(Vector &left, Vector &right, optional_ptr<const SelectionVector> sel, idx_t count,
+                            optional_ptr<SelectionVector> true_sel, optional_ptr<SelectionVector> false_sel) {
 	int64_t rv = -1;
+	if (FORVector::TryDispatchComparisonBothFOR(left, right, [&](Vector &lv, Vector &rv_vec, auto tag) {
+		    using S = typename decltype(tag)::type;
+		    rv = NumericCast<int64_t>(
+		        BinaryExecutor::Select<S, S, OP>(lv, rv_vec, sel.get(), count, true_sel.get(), false_sel.get()));
+		    return true;
+	    }))
+		return rv;
 	auto ok = FORVector::TryExecuteComparisonConstant<OP>(
 	    left, right, [&](Vector &) { rv = NumericCast<int64_t>(FORSelectAll(sel, count, true_sel, false_sel, false)); },
 	    [&](Vector &, bool cmp) { rv = NumericCast<int64_t>(FORSelectAll(sel, count, true_sel, false_sel, cmp)); },
@@ -114,7 +121,7 @@ static idx_t TemplatedSelectOperation(Vector &left, Vector &right, optional_ptr<
 		UpdateNullMask(left, sel, count, *null_mask);
 		UpdateNullMask(right, sel, count, *null_mask);
 	}
-	auto fr = TryFORConstantSelect<OP>(left, right, sel, count, true_sel, false_sel);
+	auto fr = TryFORSelect<OP>(left, right, sel, count, true_sel, false_sel);
 	if (fr >= 0)
 		return NumericCast<idx_t>(fr);
 	switch (left.GetType().InternalType()) {

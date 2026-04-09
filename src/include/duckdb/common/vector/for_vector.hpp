@@ -285,6 +285,19 @@ struct FORVector {
 		}
 	}
 
+	//! Dispatch when both operands are FOR vectors with matching stored type.
+	//! Calls func(left_stored_view, right_stored_view, stored_tag).
+	template <class FUNC>
+	static inline bool TryDispatchComparisonBothFOR(Vector &left, Vector &right, FUNC &&func) {
+		if (left.GetVectorType() != VectorType::FOR_VECTOR || right.GetVectorType() != VectorType::FOR_VECTOR)
+			return false;
+		auto st = GetStoredType(left);
+		if (GetTypeIdSize(left.GetType().InternalType()) <= 1 || st != GetStoredType(right))
+			return false;
+		auto lv = CreateStoredView(left), rv = CreateStoredView(right);
+		return DispatchStoredType(st, [&](auto tag) { return func(lv, rv, tag); });
+	}
+
 	template <class LOGICAL_T, class FUNC>
 	static inline decltype(auto) DispatchConstantInStoredDomain(const Vector &for_vec, LOGICAL_T constant,
 	                                                            FUNC &&func) {

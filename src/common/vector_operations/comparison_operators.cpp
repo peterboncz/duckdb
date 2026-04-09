@@ -219,7 +219,13 @@ static void NestedComparisonExecutor(Vector &left, Vector &right, Vector &result
 struct ComparisonExecutor {
 private:
 	template <class OP>
-	static bool TryExecuteFORConstant(Vector &left, Vector &right, Vector &result, idx_t count) {
+	static bool TryExecuteFOR(Vector &left, Vector &right, Vector &result, idx_t count) {
+		if (FORVector::TryDispatchComparisonBothFOR(left, right, [&](Vector &lv, Vector &rv, auto tag) {
+			    using S = typename decltype(tag)::type;
+			    BinaryExecutor::Execute<S, S, bool, OP>(lv, rv, result, count);
+			    return true;
+		    }))
+			return true;
 		return FORVector::TryExecuteComparisonConstant<OP>(
 		    left, right, [&](Vector &) { ConstantVector::SetNull(result); },
 		    [&](Vector &fv, bool cmp) {
@@ -245,7 +251,7 @@ public:
 	static inline void Execute(Vector &left, Vector &right, Vector &result, idx_t count) {
 		D_ASSERT(left.GetType().InternalType() == right.GetType().InternalType() &&
 		         result.GetType() == LogicalType::BOOLEAN);
-		if (TryExecuteFORConstant<OP>(left, right, result, count))
+		if (TryExecuteFOR<OP>(left, right, result, count))
 			return;
 		// the inplace loops take the result as the last parameter
 		switch (left.GetType().InternalType()) {
