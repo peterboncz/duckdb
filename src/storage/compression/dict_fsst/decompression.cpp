@@ -103,7 +103,7 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 
 	dictionary = DictionaryVector::CreateReusableDictionary(segment.type, dict_count);
 	auto &dict_data = dictionary->data;
-	auto dict_child_data = FlatVector::GetData<string_t>(dict_data);
+	auto dict_child_data = FlatVector::GetDataMutable<string_t>(dict_data);
 	auto &validity = FlatVector::Validity(dict_data);
 	D_ASSERT(dict_count >= 1);
 	validity.SetInvalid(0);
@@ -151,8 +151,7 @@ const SelectionVector &CompressedStringScanState::GetSelVec(idx_t start, idx_t s
 }
 
 void CompressedStringScanState::ScanToFlatVector(Vector &result, idx_t result_offset, idx_t start, idx_t scan_count) {
-	auto result_data = FlatVector::GetData<string_t>(result);
-	auto &validity = FlatVector::Validity(result);
+	auto result_data = FlatVector::Writer<string_t>(result, result_offset + scan_count);
 
 	// Create a decompression buffer of sufficient size if we don't already have one.
 	auto &selvec = GetSelVec(start, scan_count);
@@ -167,7 +166,7 @@ void CompressedStringScanState::ScanToFlatVector(Vector &result, idx_t result_of
 			// Lookup dict offset in index buffer
 			auto string_number = selvec.get_index(i + start_offset);
 			if (string_number == 0) {
-				validity.SetInvalid(result_offset + i);
+				result_data.SetInvalid(result_offset + i);
 			}
 			result_data[result_offset + i] = dictionary_values[string_number];
 		}
@@ -176,7 +175,7 @@ void CompressedStringScanState::ScanToFlatVector(Vector &result, idx_t result_of
 			// Lookup dict offset in index buffer
 			auto string_number = selvec.get_index(start_offset + i);
 			if (string_number == 0) {
-				validity.SetInvalid(result_offset);
+				result_data.SetInvalid(result_offset);
 			}
 			if (decompress_position > string_number) {
 				throw InternalException("DICT_FSST: not performing a sequential scan?");
@@ -194,7 +193,7 @@ void CompressedStringScanState::Select(Vector &result, idx_t start, const Select
 	D_ASSERT(!dictionary);
 	D_ASSERT(mode == DictFSSTMode::FSST_ONLY);
 	idx_t start_offset = start + 1;
-	auto result_data = FlatVector::GetData<string_t>(result);
+	auto result_data = FlatVector::Writer<string_t>(result, sel_count);
 	for (idx_t i = 0; i < sel_count; i++) {
 		// Lookup dict offset in index buffer
 		auto string_number = start_offset + sel.get_index(i);

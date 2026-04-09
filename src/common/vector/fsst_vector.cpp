@@ -19,18 +19,19 @@ VectorFSSTStringBuffer &FSSTVector::GetFSSTBuffer(const Vector &vector) {
 	return vector.buffer->Cast<VectorFSSTStringBuffer>();
 }
 
+StringHeap &FSSTVector::GetStringHeap(const Vector &vector) {
+	auto &fsst_buffer = GetFSSTBuffer(vector);
+	return fsst_buffer.GetHeap();
+}
+
 string_t FSSTVector::AddCompressedString(Vector &vector, const char *data, idx_t len) {
 	return FSSTVector::AddCompressedString(vector, string_t(data, UnsafeNumericCast<uint32_t>(len)));
 }
 
 string_t FSSTVector::AddCompressedString(Vector &vector, string_t data) {
 	D_ASSERT(vector.GetType().InternalType() == PhysicalType::VARCHAR);
-	if (data.IsInlined()) {
-		// string will be inlined: no need to store in string heap
-		return data;
-	}
-	auto &fsst_string_buffer = GetFSSTBuffer(vector);
-	return fsst_string_buffer.AddBlob(data);
+	auto &fsst_heap = GetStringHeap(vector);
+	return fsst_heap.AddBlob(data);
 }
 
 void *FSSTVector::GetDecoder(const Vector &vector) {
@@ -68,7 +69,7 @@ void FSSTVector::DecompressVector(const Vector &src, Vector &dst, idx_t src_offs
 	auto dst_mask = FlatVector::Validity(dst);
 	auto ldata = FSSTVector::GetCompressedData(src);
 	auto decoder = FSSTVector::GetDecoder(src);
-	auto tdata = FlatVector::GetData<string_t>(dst);
+	auto tdata = FlatVector::GetDataMutable<string_t>(dst);
 	auto &str_allocator = StringVector::GetStringAllocator(dst);
 	for (idx_t i = 0; i < copy_count; i++) {
 		auto source_idx = sel->get_index(src_offset + i);

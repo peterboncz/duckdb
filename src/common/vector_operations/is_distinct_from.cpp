@@ -52,7 +52,7 @@ void DistinctExecuteGeneric(Vector &left, Vector &right, Vector &result, idx_t c
 		right.ToUnifiedFormat(count, rdata);
 
 		result.SetVectorType(VectorType::FLAT_VECTOR);
-		auto result_data = FlatVector::GetData<RESULT_TYPE>(result);
+		auto result_data = FlatVector::GetDataMutable<RESULT_TYPE>(result);
 		DistinctExecuteGenericLoop<LEFT_TYPE, RIGHT_TYPE, RESULT_TYPE, OP>(
 		    UnifiedVectorFormat::GetData<LEFT_TYPE>(ldata), UnifiedVectorFormat::GetData<RIGHT_TYPE>(rdata),
 		    result_data, ldata.sel, rdata.sel, count, ldata.validity, rdata.validity, FlatVector::Validity(result));
@@ -174,9 +174,9 @@ idx_t DistinctSelectGeneric(Vector &left, Vector &right, const SelectionVector *
 #ifndef DUCKDB_SMALLER_BINARY
 template <class LEFT_TYPE, class RIGHT_TYPE, class OP, bool LEFT_CONSTANT, bool RIGHT_CONSTANT, bool NO_NULL,
           bool HAS_TRUE_SEL, bool HAS_FALSE_SEL>
-idx_t DistinctSelectFlatLoop(LEFT_TYPE *__restrict ldata, RIGHT_TYPE *__restrict rdata, const SelectionVector *sel,
-                             idx_t count, ValidityMask &lmask, ValidityMask &rmask, SelectionVector *true_sel,
-                             SelectionVector *false_sel) {
+idx_t DistinctSelectFlatLoop(const LEFT_TYPE *__restrict ldata, const RIGHT_TYPE *__restrict rdata,
+                             const SelectionVector *sel, idx_t count, ValidityMask &lmask, ValidityMask &rmask,
+                             SelectionVector *true_sel, SelectionVector *false_sel) {
 	idx_t true_count = 0, false_count = 0;
 	for (idx_t i = 0; i < count; i++) {
 		idx_t result_idx = sel->get_index(i);
@@ -202,7 +202,7 @@ idx_t DistinctSelectFlatLoop(LEFT_TYPE *__restrict ldata, RIGHT_TYPE *__restrict
 }
 
 template <class LEFT_TYPE, class RIGHT_TYPE, class OP, bool LEFT_CONSTANT, bool RIGHT_CONSTANT, bool NO_NULL>
-idx_t DistinctSelectFlatLoopSelSwitch(LEFT_TYPE *__restrict ldata, RIGHT_TYPE *__restrict rdata,
+idx_t DistinctSelectFlatLoopSelSwitch(const LEFT_TYPE *__restrict ldata, const RIGHT_TYPE *__restrict rdata,
                                       const SelectionVector *sel, idx_t count, ValidityMask &lmask, ValidityMask &rmask,
                                       SelectionVector *true_sel, SelectionVector *false_sel) {
 	if (true_sel && false_sel) {
@@ -219,7 +219,7 @@ idx_t DistinctSelectFlatLoopSelSwitch(LEFT_TYPE *__restrict ldata, RIGHT_TYPE *_
 }
 
 template <class LEFT_TYPE, class RIGHT_TYPE, class OP, bool LEFT_CONSTANT, bool RIGHT_CONSTANT>
-idx_t DistinctSelectFlatLoopSwitch(LEFT_TYPE *__restrict ldata, RIGHT_TYPE *__restrict rdata,
+idx_t DistinctSelectFlatLoopSwitch(const LEFT_TYPE *__restrict ldata, const RIGHT_TYPE *__restrict rdata,
                                    const SelectionVector *sel, idx_t count, ValidityMask &lmask, ValidityMask &rmask,
                                    SelectionVector *true_sel, SelectionVector *false_sel) {
 	return DistinctSelectFlatLoopSelSwitch<LEFT_TYPE, RIGHT_TYPE, OP, LEFT_CONSTANT, RIGHT_CONSTANT, true>(
@@ -229,8 +229,8 @@ idx_t DistinctSelectFlatLoopSwitch(LEFT_TYPE *__restrict ldata, RIGHT_TYPE *__re
 template <class LEFT_TYPE, class RIGHT_TYPE, class OP, bool LEFT_CONSTANT, bool RIGHT_CONSTANT>
 idx_t DistinctSelectFlat(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
                          SelectionVector *true_sel, SelectionVector *false_sel) {
-	auto ldata = FlatVector::GetData<LEFT_TYPE>(left);
-	auto rdata = FlatVector::GetData<RIGHT_TYPE>(right);
+	const auto ldata = FlatVector::GetData<LEFT_TYPE>(left);
+	const auto rdata = FlatVector::GetData<RIGHT_TYPE>(right);
 	if (LEFT_CONSTANT) {
 		ValidityMask validity;
 		if (ConstantVector::IsNull(left)) {
@@ -626,8 +626,21 @@ idx_t DistinctSelectList(Vector &left, Vector &right, idx_t count, const Selecti
 	Vector rentry_flattened(Vector::Ref(ListVector::GetEntry(right)));
 	lentry_flattened.Flatten(ListVector::GetListSize(left));
 	rentry_flattened.Flatten(ListVector::GetListSize(right));
-	Vector lchild(lentry_flattened, lcursor, count);
-	Vector rchild(rentry_flattened, rcursor, count);
+
+	// Struct vectors cannot be dictionary vectors, so updating the cursor selection vector
+	// after construction does not update the struct child. We need to re-slice after cursor updates.
+	bool is_struct_child = lentry_flattened.GetType().InternalType() == PhysicalType::STRUCT;
+	// Slice non-struct children, struct children are sliced in ReSliceChildren()
+	Vector lchild(is_struct_child ? Vector(Vector::Ref(lentry_flattened)) : Vector(lentry_flattened, lcursor, count));
+	Vector rchild(is_struct_child ? Vector(Vector::Ref(rentry_flattened)) : Vector(rentry_flattened, rcursor, count));
+	auto ReSliceChildren = [&]() {
+		if (is_struct_child) {
+			lchild.Reference(lentry_flattened);
+			lchild.Slice(lcursor, count);
+			rchild.Reference(rentry_flattened);
+			rchild.Slice(rcursor, count);
+		}
+	};
 
 	// To perform the positional comparison, we use a vectorisation of the following algorithm:
 	// bool CompareLists(T *left, idx_t nleft, T *right, nright) {
@@ -674,6 +687,7 @@ idx_t DistinctSelectList(Vector &left, Vector &right, idx_t count, const Selecti
 		// Set up the cursors for the current position
 		PositionListCursor(lcursor, lvdata, pos, slice_sel, count);
 		PositionListCursor(rcursor, rvdata, pos, slice_sel, count);
+		ReSliceChildren();
 
 		// Tie-break the pairs where one of the LISTs is exhausted.
 		idx_t true_count = 0;
@@ -706,6 +720,7 @@ idx_t DistinctSelectList(Vector &left, Vector &right, idx_t count, const Selecti
 			DensifyNestedSelection(true_sel, count, slice_sel);
 			PositionListCursor(lcursor, lvdata, pos, slice_sel, count);
 			PositionListCursor(rcursor, rvdata, pos, slice_sel, count);
+			ReSliceChildren();
 		}
 
 		// Find everything that definitely matches
@@ -725,6 +740,7 @@ idx_t DistinctSelectList(Vector &left, Vector &right, idx_t count, const Selecti
 			DensifyNestedSelection(false_sel, count, slice_sel);
 			PositionListCursor(lcursor, lvdata, pos, slice_sel, count);
 			PositionListCursor(rcursor, rvdata, pos, slice_sel, count);
+			ReSliceChildren();
 		}
 
 		// Find what might match on the next position
@@ -776,8 +792,20 @@ idx_t DistinctSelectArray(Vector &left, Vector &right, idx_t count, const Select
 	Vector rentry_flattened(Vector::Ref(ArrayVector::GetEntry(right)));
 	lentry_flattened.Flatten(ArrayVector::GetTotalSize(left));
 	rentry_flattened.Flatten(ArrayVector::GetTotalSize(right));
-	Vector lchild(lentry_flattened, lcursor, count);
-	Vector rchild(rentry_flattened, rcursor, count);
+
+	// Struct vectors cannot be dictionary vectors, so updating the cursor selection vector
+	// after construction does not update the struct child. We need to re-slice after cursor updates.
+	bool is_struct_child = lentry_flattened.GetType().InternalType() == PhysicalType::STRUCT;
+	auto lchild = is_struct_child ? Vector::Ref(lentry_flattened) : Vector(lentry_flattened, lcursor, count);
+	auto rchild = is_struct_child ? Vector::Ref(rentry_flattened) : Vector(rentry_flattened, rcursor, count);
+	auto ReSliceChildren = [&]() {
+		if (is_struct_child) {
+			lchild.Reference(lentry_flattened);
+			lchild.Slice(lcursor, count);
+			rchild.Reference(rentry_flattened);
+			rchild.Slice(rcursor, count);
+		}
+	};
 
 	// Get pointers to the list entries
 	UnifiedVectorFormat lvdata;
@@ -808,6 +836,7 @@ idx_t DistinctSelectArray(Vector &left, Vector &right, idx_t count, const Select
 		// Set up the cursors for the current position
 		PositionArrayCursor(lcursor, lvdata, pos, slice_sel, count, array_size);
 		PositionArrayCursor(rcursor, rvdata, pos, slice_sel, count, array_size);
+		ReSliceChildren();
 
 		idx_t true_count = 0;
 		idx_t false_count = 0;
@@ -829,6 +858,7 @@ idx_t DistinctSelectArray(Vector &left, Vector &right, idx_t count, const Select
 			DensifyNestedSelection(false_sel, count, slice_sel);
 			PositionArrayCursor(lcursor, lvdata, pos, slice_sel, count, array_size);
 			PositionArrayCursor(rcursor, rvdata, pos, slice_sel, count, array_size);
+			ReSliceChildren();
 		}
 
 		// Find what might match on the next position
@@ -1167,8 +1197,7 @@ void NestedDistinctExecute(Vector &left, Vector &right, Vector &result, idx_t co
 	    TemplatedDistinctSelectOperation<OP>(left, right, nullptr, count, &true_sel, &false_sel, nullptr);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<bool>(result);
-
+	auto result_data = FlatVector::Writer<bool>(result, count);
 	for (idx_t i = 0; i < match_count; ++i) {
 		const auto idx = true_sel.get_index(i);
 		result_data[idx] = true;
