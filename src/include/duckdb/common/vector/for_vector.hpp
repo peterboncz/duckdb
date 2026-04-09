@@ -155,7 +155,7 @@ struct FORVector {
 	static PhysicalType GetStoredType(const Vector &vector);
 	static inline ValidityMask &Validity(const Vector &vector) {
 		D_ASSERT(vector.GetVectorType() == VectorType::FOR_VECTOR);
-		return vector.validity;
+		return vector.buffer->GetValidityMask();
 	}
 
 	//! Get the max value (stored in auxiliary data)

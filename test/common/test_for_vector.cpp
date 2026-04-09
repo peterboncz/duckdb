@@ -338,7 +338,7 @@ TEST_CASE("FOR Vector - addition with negative constant", "[for_vector]") {
 TEST_CASE("FOR Vector - compressed materialization decompress with nonzero min", "[for_vector]") {
 	idx_t count = 4;
 	Vector compressed(LogicalType::UTINYINT);
-	auto compressed_data = FlatVector::GetData<uint8_t>(compressed);
+	auto compressed_data = FlatVector::GetDataMutable<uint8_t>(compressed);
 	compressed_data[0] = 0;
 	compressed_data[1] = 10;
 	compressed_data[2] = 20;

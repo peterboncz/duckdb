@@ -59,7 +59,7 @@ void IntegralCompressFunction(DataChunk &args, ExpressionState &state, Vector &r
 
 		if (stored_size <= result_size && min_val >= INPUT_TYPE(0) &&
 		    static_cast<uint64_t>(min_val) <= static_cast<uint64_t>(NumericLimits<RESULT_TYPE>::Maximum())) {
-			auto result_data = FlatVector::GetData<RESULT_TYPE>(result);
+			auto result_data = FlatVector::GetDataMutable<RESULT_TYPE>(result);
 			bool handled = FORVector::DispatchStoredType(stored_type, [&](auto tag) {
 				using STORED_T = typename decltype(tag)::type;
 				auto stored_data = reinterpret_cast<const STORED_T *>(src);

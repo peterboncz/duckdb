@@ -97,7 +97,7 @@ Vector FORVector::CreateStoredView(const Vector &for_vec) {
 template <class LOGICAL_T>
 static void DecompressImpl(const Vector &source, Vector &target, idx_t count, const SelectionVector *sel = nullptr) {
 	auto src = FORVector::GetData(source);
-	auto dst = FlatVector::GetData(target);
+	auto dst = FlatVector::GetDataMutable(target);
 	FORVector::DispatchStoredType(FORVector::GetStoredType(source), [&](auto tag) {
 		using S = typename decltype(tag)::type;
 		auto stored = reinterpret_cast<const S *>(src);
@@ -127,7 +127,7 @@ void FORVector::Create(Vector &vector, PhysicalType stored_type, MAX_T max_value
 	D_ASSERT(vector.buffer);
 	D_ASSERT(vector.buffer->GetData());
 	vector.vector_type = VectorType::FOR_VECTOR;
-	vector.validity.Reset();
+	vector.buffer->GetValidityMask().Reset();
 	FORVector::SetMetadata<MAX_T>(vector, stored_type, max_value);
 }
 

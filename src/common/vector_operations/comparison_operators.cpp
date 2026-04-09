@@ -230,7 +230,7 @@ private:
 		    left, right, [&](Vector &) { ConstantVector::SetNull(result); },
 		    [&](Vector &fv, bool cmp) {
 			    result.SetVectorType(VectorType::FLAT_VECTOR);
-			    memset(FlatVector::GetData(result), cmp ? 1 : 0, count);
+			    memset(FlatVector::GetDataMutable(result), cmp ? 1 : 0, count);
 			    FlatVector::Validity(result) = FORVector::Validity(fv);
 		    },
 		    [&](Vector &fv, bool for_is_right, auto tag, auto ac) {
