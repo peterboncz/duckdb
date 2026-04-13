@@ -1,6 +1,7 @@
 #include "duckdb/execution/physical_operator.hpp"
 
 #include "duckdb/common/vector/dictionary_vector.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/render_tree.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -459,12 +460,27 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 		}
 	}
 
+	// Pre-convert empty target vectors to FOR when source has FOR (for compaction preservation)
+	auto prepare_for_append = [](DataChunk &target, const DataChunk &source) {
+		if (target.size() != 0) return;
+		for (idx_t ci = 0; ci < source.ColumnCount(); ci++) {
+			if (source.data[ci].GetVectorType() != VectorType::FOR_VECTOR) continue;
+			target.data[ci].SetVectorType(VectorType::FOR_VECTOR);
+			auto st = FORVector::GetStoredType(source.data[ci]);
+			FORVector::DispatchLogicalType(source.data[ci].GetType().InternalType(), [&](auto tag) {
+				using T = typename decltype(tag)::type;
+				FORVector::SetMetadata<T>(target.data[ci], st, FORVector::GetMax<T>(source.data[ci]));
+			});
+		}
+	};
+
 	switch (execution_mode) {
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED_APPEND_CHUNK: {
 		auto tmp = make_uniq<DataChunk>();
 		tmp->Move(chunk);
 		chunk.Move(*state.cached_chunk);
 		state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());
+		prepare_for_append(*state.cached_chunk, *tmp);
 		state.cached_chunk->Append(*tmp);
 		break;
 	}
@@ -479,20 +495,17 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 		state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());
 		break;
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED_THEN_CHUNK_VIA_CONTINUATION: {
-		// Swap chunk and *state.cached_chunk
 		auto tmp = make_uniq<DataChunk>();
 		tmp->Move(chunk);
 		chunk.Move(*state.cached_chunk);
 		state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());
 		state.cached_chunk->Move(*tmp);
-
-		// Now chunk holds what was in (*state.cached_chunk), and it's returned directly
-		// While what was in chunk will be returned at next iteration via continuation
 		state.must_return_continuation_chunk = true;
 		state.cached_result = child_result;
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
 	case CachingPhysicalOperatorExecuteMode::APPEND_CHUNK: {
+		prepare_for_append(*state.cached_chunk, chunk);
 		state.cached_chunk->Append(chunk);
 		chunk.Reset();
 		break;

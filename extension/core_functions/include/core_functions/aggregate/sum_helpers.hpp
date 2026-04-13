@@ -11,7 +11,6 @@
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/operator/add.hpp"
 #include "duckdb/common/operator/multiply.hpp"
-#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/function/aggregate_state.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 
@@ -188,88 +187,5 @@ struct BaseSumOperation {
 		return true;
 	}
 };
-
-template <class STATE, class ADDOP>
-static inline void AddFORPartial(STATE &state, int64_t sum) {
-	if (sum == 0)
-		return;
-	state.isset = true;
-	ADDOP::template AddNumber<STATE, int64_t>(state, sum);
-}
-template <class INPUT_TYPE>
-static bool TryGetFORSumScanData(Vector &input, idx_t count,
-                                 FORVector::ScanData<typename FORUnsignedType<INPUT_TYPE>::type> &sd) {
-	return FORVector::TryGetScanData(input, sd) && count != 0 &&
-	       NumericCast<int64_t>(sd.max_value) <= NumericLimits<int64_t>::Maximum() / NumericCast<int64_t>(count);
-}
-template <class INPUT_TYPE, class STATE, class ADDOP>
-static bool TryFORSimpleSumUpdate(Vector &input, STATE &state, idx_t count) {
-	using U = typename FORUnsignedType<INPUT_TYPE>::type;
-	FORVector::ScanData<U> sd;
-	if (!TryGetFORSumScanData<INPUT_TYPE>(input, count, sd))
-		return false;
-	return FORVector::DispatchStoredType(sd.stored_type, [&](auto tag) {
-		using S = typename decltype(tag)::type;
-		int64_t sum = 0;
-		FORVector::ForEachValue<S>(sd, count, [&](idx_t, S v) { sum += UnsafeNumericCast<int64_t>(v); });
-		AddFORPartial<STATE, ADDOP>(state, sum);
-		return true;
-	});
-}
-template <class INPUT_TYPE, class STORED_T, class STATE, class ADDOP>
-static void FORGroupedSum(const FORVector::ScanData<typename FORUnsignedType<INPUT_TYPE>::type> &sd, idx_t count,
-                          STATE *const *states, const SelectionVector &sel, idx_t max_gid) {
-	if (max_gid >= 256) { // T2: run-length locality
-		idx_t prev = DConstants::INVALID_INDEX;
-		int64_t sum = 0;
-		FORVector::ForEachValue<STORED_T>(sd, count, [&](idx_t i, STORED_T v) {
-			auto gid = sel.get_index(i);
-			if (prev != DConstants::INVALID_INDEX && gid != prev) {
-				AddFORPartial<STATE, ADDOP>(*states[prev], sum);
-				sum = 0;
-			}
-			sum += UnsafeNumericCast<int64_t>(v);
-			prev = gid;
-		});
-		if (prev != DConstants::INVALID_INDEX)
-			AddFORPartial<STATE, ADDOP>(*states[prev], sum);
-		return;
-	}
-	// T3: bitmap-tracked ≤256 groups
-	uint64_t seen_bm[4] = {};
-	uint8_t seen[256];
-	int64_t sums[256] = {};
-	idx_t n_seen = 0;
-	FORVector::ForEachValue<STORED_T>(sd, count, [&](idx_t i, STORED_T v) {
-		auto gid = sel.get_index(i);
-		auto bit = uint64_t(1) << (gid & 63);
-		if (!(seen_bm[gid >> 6] & bit)) {
-			seen_bm[gid >> 6] |= bit;
-			seen[n_seen++] = UnsafeNumericCast<uint8_t>(gid);
-		}
-		sums[gid] += UnsafeNumericCast<int64_t>(v);
-	});
-	for (idx_t i = 0; i < n_seen; i++)
-		AddFORPartial<STATE, ADDOP>(*states[seen[i]], sums[seen[i]]);
-}
-template <class INPUT_TYPE, class STATE, class ADDOP>
-static bool TryFORGroupedSumUpdate(Vector &input, Vector &states, idx_t count) {
-	using U = typename FORUnsignedType<INPUT_TYPE>::type;
-	FORVector::ScanData<U> sd;
-	if (!TryGetFORSumScanData<INPUT_TYPE>(input, count, sd))
-		return false;
-	UnifiedVectorFormat sdata;
-	states.ToUnifiedFormat(count, sdata);
-	auto ptrs = UnifiedVectorFormat::GetData<STATE *>(sdata);
-	auto &sel = *sdata.sel;
-	idx_t max_gid = 0;
-	for (idx_t i = 0; i < count; i++)
-		max_gid = MaxValue(max_gid, sel.get_index(i));
-	return FORVector::DispatchStoredType(sd.stored_type, [&](auto tag) {
-		using S = typename decltype(tag)::type;
-		FORGroupedSum<INPUT_TYPE, S, STATE, ADDOP>(sd, count, ptrs, sel, max_gid);
-		return true;
-	});
-}
 
 } // namespace duckdb

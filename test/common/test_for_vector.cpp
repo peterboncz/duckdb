@@ -12,6 +12,9 @@
 #include "duckdb/function/scalar/compressed_materialization_utils.hpp"
 #include "duckdb/function/scalar/operators.hpp"
 #include "duckdb/function/scalar/operator_functions.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/allocator.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
 
 using namespace duckdb;
 
@@ -97,6 +100,30 @@ TEST_CASE("FOR Vector - comparison with constant", "[for_vector]") {
 	// Test: for_vec >= 120
 	match_count = VectorOperations::GreaterThanEquals(for_vec, const_vec, nullptr, count, &true_sel, &false_sel);
 	REQUIRE(match_count == 3); // indices 2, 3, 4
+}
+
+TEST_CASE("FOR Vector - comparison between two FOR vectors", "[for_vector]") {
+	idx_t count = 4;
+	// left:  [100, 200, 150, 300] stored as uint16
+	// right: [150, 150, 150, 150] stored as uint16
+	Vector left(LogicalType::BIGINT);
+	FORVector::Create<int64_t>(left, PhysicalType::UINT16, 300);
+	auto ldata = reinterpret_cast<uint16_t *>(FORVector::GetData(left));
+	ldata[0] = 100; ldata[1] = 200; ldata[2] = 150; ldata[3] = 300;
+
+	Vector right(LogicalType::BIGINT);
+	FORVector::Create<int64_t>(right, PhysicalType::UINT16, 150);
+	auto rdata = reinterpret_cast<uint16_t *>(FORVector::GetData(right));
+	rdata[0] = 150; rdata[1] = 150; rdata[2] = 150; rdata[3] = 150;
+
+	SelectionVector true_sel(count), false_sel(count);
+	auto match = VectorOperations::LessThan(left, right, nullptr, count, &true_sel, &false_sel);
+	REQUIRE(match == 1);       // only index 0: 100 < 150
+	REQUIRE(true_sel.get_index(0) == 0);
+
+	match = VectorOperations::Equals(left, right, nullptr, count, &true_sel, &false_sel);
+	REQUIRE(match == 1);       // only index 2: 150 == 150
+	REQUIRE(true_sel.get_index(0) == 2);
 }
 
 TEST_CASE("FOR Vector - comparison with out-of-range constant", "[for_vector]") {
@@ -271,9 +298,9 @@ static void ExecuteBinaryFunction(ScalarFunction function, Vector &left, Vector 
 	input.data[0].Reference(left);
 	input.data[1].Reference(right);
 	input.SetCardinality(count);
-	typename std::aligned_storage<sizeof(ExpressionState), alignof(ExpressionState)>::type state_storage;
-	auto &dummy_state = *reinterpret_cast<ExpressionState *>(&state_storage);
-	function.GetFunctionCallback()(input, dummy_state, result);
+	// Zero-initialized fake state — HasContext() reads executor ptr which will be null → returns false
+	alignas(ExpressionState) char state_buf[sizeof(ExpressionState)] = {};
+	function.GetFunctionCallback()(input, *reinterpret_cast<ExpressionState *>(state_buf), result);
 }
 
 static ScalarFunction GetMultiplyBigintFunction() {
@@ -358,4 +385,94 @@ TEST_CASE("FOR Vector - compressed materialization decompress with nonzero min",
 	REQUIRE(data[1] == 1010);
 	REQUIRE(data[2] == 1020);
 	REQUIRE(data[3] == 1030);
+}
+
+TEST_CASE("FOR Vector - arithmetic between two FOR vectors", "[for_vector]") {
+	idx_t count = 4;
+	auto left = CreateSimpleFOR(100, count);   // [100, 101, 102, 103]
+	auto right = CreateSimpleFOR(200, count);  // [200, 201, 202, 203]
+	Vector result(LogicalType::BIGINT);
+	ExecuteBinaryFunction(AddFunction::GetFunction(LogicalType::BIGINT, LogicalType::BIGINT), left, right, result, count);
+	REQUIRE(result.GetVectorType() == VectorType::FOR_VECTOR); // proves FOR path fired
+	result.Flatten(count);
+	auto data = FlatVector::GetData<int64_t>(result);
+	for (idx_t i = 0; i < count; i++) REQUIRE(data[i] == static_cast<int64_t>(300 + 2 * i));
+}
+
+TEST_CASE("FOR Vector - DataChunk::Append preserves FOR", "[for_vector]") {
+	// Simulates CachingPhysicalOperator: pre-convert target to FOR, then Append copies narrow data
+	DataChunk target;
+	target.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT});
+
+	// First append: manually set target to FOR (as CachingOperator does), then Append
+	auto src1 = CreateSimpleFOR(100, 5);
+	target.data[0].SetVectorType(VectorType::FOR_VECTOR);
+	FORVector::SetMetadata<int64_t>(target.data[0], FORVector::GetStoredType(src1), FORVector::GetMax<int64_t>(src1));
+	DataChunk chunk1;
+	chunk1.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT});
+	chunk1.data[0].Reference(src1);
+	chunk1.SetCardinality(5);
+	target.Append(chunk1);
+	REQUIRE(target.data[0].GetVectorType() == VectorType::FOR_VECTOR);
+	REQUIRE(target.size() == 5);
+
+	// Second append: target already FOR → Copy preserves it
+	auto src2 = CreateSimpleFOR(200, 3);
+	DataChunk chunk2;
+	chunk2.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT});
+	chunk2.data[0].Reference(src2);
+	chunk2.SetCardinality(3);
+	target.Append(chunk2);
+	REQUIRE(target.data[0].GetVectorType() == VectorType::FOR_VECTOR);
+	REQUIRE(target.size() == 8);
+
+	// Verify values after flatten
+	target.data[0].Flatten(8);
+	auto data = FlatVector::GetData<int64_t>(target.data[0]);
+	REQUIRE(data[0] == 100);
+	REQUIRE(data[4] == 104);
+	REQUIRE(data[5] == 200);
+	REQUIRE(data[7] == 202);
+}
+
+TEST_CASE("FOR Vector - TryWidenType preserves FOR across type widening", "[for_vector]") {
+	Vector source(LogicalType::BIGINT);
+	FORVector::Create<int64_t>(source, PhysicalType::UINT16, 500);
+	auto stored = reinterpret_cast<uint16_t *>(FORVector::GetData(source));
+	stored[0] = 100; stored[1] = 200; stored[2] = 500;
+
+	Vector result(LogicalType::HUGEINT);
+	REQUIRE(FORVector::TryWidenType(source, result));
+	REQUIRE(result.GetVectorType() == VectorType::FOR_VECTOR);
+	REQUIRE(FORVector::GetStoredType(result) == PhysicalType::UINT16); // same narrow storage
+	// Verify the buffer is shared (zero-copy)
+	REQUIRE(FORVector::GetData(result) == FORVector::GetData(source));
+	// Verify values decompress correctly as hugeint
+	result.Flatten(3);
+	auto data = FlatVector::GetData<hugeint_t>(result);
+	REQUIRE(data[0] == hugeint_t(0, 100));
+	REQUIRE(data[1] == hugeint_t(0, 200));
+	REQUIRE(data[2] == hugeint_t(0, 500));
+}
+
+TEST_CASE("FOR Vector - compress fast path on FOR input", "[for_vector]") {
+	// Create FOR vector simulating scan output, then compress (subtract min_val)
+	idx_t count = 4;
+	Vector for_vec(LogicalType::BIGINT);
+	FORVector::Create<int64_t>(for_vec, PhysicalType::UINT16, 1030);
+	auto stored = reinterpret_cast<uint16_t *>(FORVector::GetData(for_vec));
+	stored[0] = 1000; stored[1] = 1010; stored[2] = 1020; stored[3] = 1030;
+
+	// Compress: subtract min_val=1000, result type UTINYINT (fits 0..30)
+	Vector min_vec(Value::BIGINT(1000));
+	Vector result(LogicalType::UTINYINT);
+	auto compress = CMIntegralCompressFun::GetFunction(LogicalType::BIGINT, LogicalType::UTINYINT);
+	ExecuteBinaryFunction(compress, for_vec, min_vec, result, count);
+
+	// Result should be FLAT UTINYINT with values [0, 10, 20, 30]
+	auto data = FlatVector::GetData<uint8_t>(result);
+	REQUIRE(data[0] == 0);
+	REQUIRE(data[1] == 10);
+	REQUIRE(data[2] == 20);
+	REQUIRE(data[3] == 30);
 }
