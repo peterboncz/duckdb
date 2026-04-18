@@ -6,47 +6,34 @@
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
-// FOR metadata storage via AuxiliaryData
+// FOR metadata — stored inline on VectorBuffer (zero allocation)
 //===--------------------------------------------------------------------===//
-// Base class with stored_type (accessible without knowing T)
-struct FORMetadataBase : public AuxiliaryDataHolder {
-	PhysicalType stored_type;
-	explicit FORMetadataBase(PhysicalType stored_type_p) : stored_type(stored_type_p) {
-	}
-};
-
-// Typed subclass with the max value
-template <class T>
-struct FORMetadata : public FORMetadataBase {
-	T max_value;
-	FORMetadata(PhysicalType stored_type_p, T max_value_p) : FORMetadataBase(stored_type_p), max_value(max_value_p) {
-	}
-};
-
 PhysicalType FORVector::GetStoredType(const Vector &vector) {
 	D_ASSERT(vector.GetVectorType() == VectorType::FOR_VECTOR);
-	auto &aux = vector.buffer->GetAuxiliaryData();
-	D_ASSERT(aux);
-	D_ASSERT(!aux->data.empty());
-	return static_cast<FORMetadataBase &>(*aux->data[0]).stored_type;
+	return vector.buffer->for_stored_type;
+}
+
+uint8_t FORVector::GetRangeBits(const Vector &vector) {
+	auto max_value = vector.buffer->for_max_value;
+	uint8_t result = 0;
+	while (max_value != 0) {
+		result++;
+		max_value >>= 1;
+	}
+	return result;
 }
 
 template <class T>
 T FORVector::GetMax(const Vector &vector) {
 	D_ASSERT(vector.GetVectorType() == VectorType::FOR_VECTOR);
-	auto &aux = vector.buffer->GetAuxiliaryData();
-	D_ASSERT(aux);
-	D_ASSERT(!aux->data.empty());
-	using META_T = typename FORUnsignedType<T>::type;
-	return UnsafeNumericCast<T>(static_cast<FORMetadata<META_T> &>(*aux->data[0]).max_value);
+	return FORValueOps<T>::FromUnsignedStorage(vector.buffer->for_max_value);
 }
 
 template <class T>
 void FORVector::SetMetadata(Vector &vector, PhysicalType stored_type, T max_value) {
 	D_ASSERT(vector.GetVectorType() == VectorType::FOR_VECTOR);
-	using META_T = typename FORUnsignedType<T>::type;
-	vector.buffer->ClearAuxiliaryData();
-	vector.buffer->AddAuxiliaryData(make_uniq<FORMetadata<META_T>>(stored_type, UnsafeNumericCast<META_T>(max_value)));
+	vector.buffer->for_stored_type = stored_type;
+	vector.buffer->for_max_value = FORValueOps<T>::ToUnsignedStorage(max_value);
 }
 
 // Explicit instantiations
@@ -98,8 +85,7 @@ template <class LOGICAL_T>
 static void DecompressImpl(const Vector &source, Vector &target, idx_t count, const SelectionVector *sel = nullptr) {
 	auto src = FORVector::GetData(source);
 	auto dst = FlatVector::GetDataMutable(target);
-	FORVector::DispatchStoredType(FORVector::GetStoredType(source), [&](auto tag) {
-		using S = typename decltype(tag)::type;
+	FOR_SWITCH_STORED(FORVector::GetStoredType(source), S, {
 		auto stored = reinterpret_cast<const S *>(src);
 		auto target_data = reinterpret_cast<LOGICAL_T *>(dst);
 		for (idx_t i = 0; i < count; i++) {
@@ -110,25 +96,40 @@ static void DecompressImpl(const Vector &source, Vector &target, idx_t count, co
 
 void FORVector::Decompress(const Vector &source, Vector &target, idx_t count) {
 	D_ASSERT(source.GetVectorType() == VectorType::FOR_VECTOR);
-	DispatchLogicalType(source.GetType().InternalType(),
-	                    [&](auto tag) { DecompressImpl<typename decltype(tag)::type>(source, target, count); });
+	FOR_SWITCH_LOGICAL(source.GetType().InternalType(), T, { DecompressImpl<T>(source, target, count); });
 }
 void FORVector::Decompress(const Vector &source, Vector &target, const SelectionVector &sel, idx_t count) {
 	D_ASSERT(source.GetVectorType() == VectorType::FOR_VECTOR);
-	DispatchLogicalType(source.GetType().InternalType(),
-	                    [&](auto tag) { DecompressImpl<typename decltype(tag)::type>(source, target, count, &sel); });
+	FOR_SWITCH_LOGICAL(source.GetType().InternalType(), T, { DecompressImpl<T>(source, target, count, &sel); });
+}
+
+void FORVector::CopyToFlat(const Vector &source, const SelectionVector &sel, Vector &target,
+                           idx_t source_offset, idx_t target_offset, idx_t copy_count) {
+	D_ASSERT(source.GetVectorType() == VectorType::FOR_VECTOR);
+	D_ASSERT(target.GetVectorType() == VectorType::FLAT_VECTOR);
+	auto st = GetStoredType(source);
+	auto *src = GetData(source);
+	FOR_SWITCH_LOGICAL(source.GetType().InternalType(), LT, {
+		auto *dst = FlatVector::GetDataMutable<LT>(target);
+		FOR_SWITCH_STORED(st, ST, {
+			auto *s = reinterpret_cast<const ST *>(src);
+			for (idx_t i = 0; i < copy_count; i++) {
+				dst[target_offset + i] = WidenStored<LT, ST>(s[sel.get_index(source_offset + i)]);
+			}
+		});
+	});
 }
 
 //===--------------------------------------------------------------------===//
 // Create
 //===--------------------------------------------------------------------===//
-template <class MAX_T>
-void FORVector::Create(Vector &vector, PhysicalType stored_type, MAX_T max_value) {
+template <class T>
+void FORVector::Create(Vector &vector, PhysicalType stored_type, T max_value) {
 	D_ASSERT(vector.buffer);
 	D_ASSERT(vector.buffer->GetData());
 	vector.vector_type = VectorType::FOR_VECTOR;
 	vector.buffer->GetValidityMask().Reset();
-	FORVector::SetMetadata<MAX_T>(vector, stored_type, max_value);
+	FORVector::SetMetadata<T>(vector, stored_type, max_value);
 }
 
 bool FORVector::TryWidenType(Vector &source, Vector &result) {
@@ -142,13 +143,8 @@ bool FORVector::TryWidenType(Vector &source, Vector &result) {
 	result.CopyBuffer(source);
 	result.SetVectorType(VectorType::FOR_VECTOR);
 	Validity(result) = Validity(source);
-	uint64_t max_raw = DispatchLogicalType(source.GetType().InternalType(), [&](auto tag) {
-		return UnsafeNumericCast<uint64_t>(GetMax<typename decltype(tag)::type>(source));
-	});
-	DispatchLogicalType(result.GetType().InternalType(), [&](auto tag) {
-		using T = typename decltype(tag)::type;
-		SetMetadata<T>(result, st, WidenStored<T, uint64_t>(max_raw));
-	});
+	uint64_t max_raw = UnsafeNumericCast<uint64_t>(source.buffer->for_max_value);
+	FOR_SWITCH_LOGICAL(result.GetType().InternalType(), T, { SetMetadata<T>(result, st, WidenStored<T, uint64_t>(max_raw)); });
 	return true;
 }
 

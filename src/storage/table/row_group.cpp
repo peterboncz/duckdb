@@ -18,6 +18,7 @@
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/row_version_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
@@ -712,7 +713,29 @@ void RowGroup::Scan(ScanOptions options, CollectionScanState &state, DataChunk &
 					if (table_filter.IsAlwaysTrue()) {
 						continue;
 					}
-					result.data[table_filter.scan_column_index].Slice(sel, approved_tuple_count);
+					auto &vec = result.data[table_filter.scan_column_index];
+					// For FOR vectors: in-place gather instead of Slice→DICTIONARY(FOR).
+					// Safe: filter selections are monotonically increasing (sel[i]>=i).
+					if (vec.GetVectorType() == VectorType::FOR_VECTOR) {
+						auto stored_type = FORVector::GetStoredType(vec);
+						auto *buf = vec.GetBuffer()->GetData();
+						FOR_SWITCH_STORED(stored_type, ST, {
+							auto *data = reinterpret_cast<ST *>(buf);
+							for (idx_t i = 0; i < approved_tuple_count; i++) {
+								data[i] = data[sel.get_index(i)];
+							}
+						});
+						auto &validity = vec.GetBuffer()->GetValidityMask();
+						if (validity.CanHaveNull()) {
+							ValidityMask new_validity(approved_tuple_count);
+							for (idx_t i = 0; i < approved_tuple_count; i++) {
+								new_validity.Set(i, validity.RowIsValid(sel.get_index(i)));
+							}
+							validity = std::move(new_validity);
+						}
+					} else {
+						vec.Slice(sel, approved_tuple_count);
+					}
 				}
 			}
 			if (approved_tuple_count == 0) {

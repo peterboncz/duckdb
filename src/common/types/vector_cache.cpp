@@ -52,8 +52,13 @@ public:
 		D_ASSERT(type == result.GetType());
 		auto internal_type = type.InternalType();
 		result.vector_type = VectorType::FLAT_VECTOR;
+		// Pre-allocate a flatten buffer for FOR vectors (once, on first use).
+		if (!buffer->flatten_cache && GetTypeIdSize(internal_type) > 1) {
+			buffer->flatten_cache = VectorBuffer::CreateStandardVector(internal_type);
+		}
 		buffer->ClearAuxiliaryData();
 		AssignSharedPointer(result.buffer, buffer);
+		result.buffer->cache_owned = true;
 		result.buffer->GetValidityMask().Reset(capacity);
 		switch (internal_type) {
 		case PhysicalType::LIST: {

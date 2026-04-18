@@ -46,6 +46,7 @@ void TemplatedFORCopy(const Vector &source, const SelectionVector &sel, Vector &
 		tdata[target_offset + i] = ldata[source_idx];
 	}
 }
+
 } // namespace
 
 static const ValidityMask &ExtractValidityMask(const Vector &v) {
@@ -106,17 +107,31 @@ void VectorOperations::Copy(const Vector &source_p, Vector &target, const Select
 		}
 		case VectorType::FOR_VECTOR: {
 			auto st = FORVector::GetStoredType(*source);
-			if (target.GetVectorType() == VectorType::FOR_VECTOR && FORVector::GetStoredType(target) == st) {
-				FORVector::DispatchLogicalType(source->GetType().InternalType(), [&](auto tag) {
-					using T = typename decltype(tag)::type;
-					auto m = FORVector::GetMax<T>(*source);
-					if (target_offset == 0 || m > FORVector::GetMax<T>(target)) {
-						FORVector::SetMetadata<T>(target, st, m);
+			if (target.GetVectorType() == VectorType::FOR_VECTOR && FORVector::HasSameMetadata(*source, target)) {
+				FOR_SWITCH_LOGICAL(source->GetType().InternalType(), LOGICAL_T, {
+					auto source_max = FORVector::GetMax<LOGICAL_T>(*source);
+					if (target_offset == 0 || source_max > FORVector::GetMax<LOGICAL_T>(target)) {
+						FORVector::SetMetadata<LOGICAL_T>(target, st, source_max);
 					}
 				});
 				finished = true;
 				break;
 			}
+			if (target.GetVectorType() == VectorType::FOR_VECTOR) {
+				target.Flatten(target_offset);
+			}
+			// Direct FOR→FLAT decompress-copy: avoids allocating a temp flat vector
+			// (the previous Reference+Flatten path bumped use_count and forced the allocating fallback).
+			if (target.GetVectorType() == VectorType::FLAT_VECTOR) {
+				if (copy_count > 0) {
+					auto &smask = FORVector::Validity(*source);
+					auto &tmask = FlatVector::Validity(target);
+					tmask.CopySel(smask, *sel, source_offset, target_offset, copy_count);
+					FORVector::CopyToFlat(*source, *sel, target, source_offset, target_offset, copy_count);
+				}
+				return;
+			}
+			// Other target types (e.g. FOR with mismatched stored type): fall back to flatten.
 			Vector flat(source->GetType());
 			flat.Reference(*source);
 			flat.Flatten(STANDARD_VECTOR_SIZE);
@@ -168,10 +183,8 @@ void VectorOperations::Copy(const Vector &source_p, Vector &target, const Select
 	}
 	if (source->GetVectorType() == VectorType::FOR_VECTOR) {
 		D_ASSERT(target.GetVectorType() == VectorType::FOR_VECTOR);
-		FORVector::DispatchStoredType(FORVector::GetStoredType(*source), [&](auto tag) {
-			using STORED_T = typename decltype(tag)::type;
+		FOR_SWITCH_STORED(FORVector::GetStoredType(*source), STORED_T, {
 			TemplatedFORCopy<STORED_T>(*source, *sel, target, source_offset, target_offset, copy_count);
-			return true;
 		});
 		return;
 	}

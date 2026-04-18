@@ -467,8 +467,7 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 			if (source.data[ci].GetVectorType() != VectorType::FOR_VECTOR) continue;
 			target.data[ci].SetVectorType(VectorType::FOR_VECTOR);
 			auto st = FORVector::GetStoredType(source.data[ci]);
-			FORVector::DispatchLogicalType(source.data[ci].GetType().InternalType(), [&](auto tag) {
-				using T = typename decltype(tag)::type;
+			FOR_SWITCH_LOGICAL(source.data[ci].GetType().InternalType(), T, {
 				FORVector::SetMetadata<T>(target.data[ci], st, FORVector::GetMax<T>(source.data[ci]));
 			});
 		}

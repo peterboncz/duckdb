@@ -93,25 +93,57 @@ template <class OP>
 static int64_t TryFORSelect(Vector &left, Vector &right, optional_ptr<const SelectionVector> sel, idx_t count,
                             optional_ptr<SelectionVector> true_sel, optional_ptr<SelectionVector> false_sel) {
 	int64_t rv = -1;
-	if (FORVector::TryDispatchComparisonBothFOR(left, right, [&](Vector &lv, Vector &rv_vec, auto tag) {
-		    using S = typename decltype(tag)::type;
-		    rv = NumericCast<int64_t>(
-		        BinaryExecutor::Select<S, S, OP>(lv, rv_vec, sel.get(), count, true_sel.get(), false_sel.get()));
-		    return true;
-	    }))
+	if (left.GetVectorType() == VectorType::FOR_VECTOR && right.GetVectorType() == VectorType::FOR_VECTOR &&
+	    FORVector::HasSameMetadata(left, right)) {
+		auto lv = FORVector::CreateStoredView(left);
+		auto rv_vec = FORVector::CreateStoredView(right);
+		auto st = FORVector::GetStoredType(left);
+		FOR_SWITCH_STORED(st, S, {
+			rv = NumericCast<int64_t>(
+			    BinaryExecutor::Select<S, S, OP>(lv, rv_vec, sel.get(), count, true_sel.get(), false_sel.get()));
+		});
 		return rv;
-	auto ok = FORVector::TryExecuteComparisonConstant<OP>(
-	    left, right, [&](Vector &) { rv = NumericCast<int64_t>(FORSelectAll(sel, count, true_sel, false_sel, false)); },
-	    [&](Vector &, bool cmp) { rv = NumericCast<int64_t>(FORSelectAll(sel, count, true_sel, false_sel, cmp)); },
-	    [&](Vector &fv, bool for_is_right, auto tag, auto ac) {
-		    using S = typename decltype(tag)::type;
-		    auto sv = FORVector::CreateStoredView(fv);
-		    Vector cv(Value::CreateValue(ac));
-		    auto &l = for_is_right ? cv : sv, &r = for_is_right ? sv : cv;
-		    rv = NumericCast<int64_t>(
-		        BinaryExecutor::Select<S, S, OP>(l, r, sel.get(), count, true_sel.get(), false_sel.get()));
-	    });
-	return ok ? rv : -1;
+	}
+	Vector *for_vec = nullptr;
+	Vector *const_vec = nullptr;
+	bool for_is_right = false;
+	if (left.GetVectorType() == VectorType::FOR_VECTOR && right.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+		for_vec = &left;
+		const_vec = &right;
+	} else if (right.GetVectorType() == VectorType::FOR_VECTOR && left.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+		for_vec = &right;
+		const_vec = &left;
+		for_is_right = true;
+	} else {
+		return -1;
+	}
+	if (ConstantVector::IsNull(*const_vec)) {
+		rv = NumericCast<int64_t>(FORSelectAll(sel, count, true_sel, false_sel, false));
+		return rv;
+	}
+	auto phys = for_vec->GetType().InternalType();
+	FOR_SWITCH_LOGICAL(phys, LT, {
+		LT constant = ConstantVector::GetData<LT>(*const_vec)[0];
+		auto range = FORVector::RangeAnalysis<LT>(*for_vec, constant);
+		bool comparison_result;
+		if (FORVector::ShortCircuitComparison<OP, LT>(range, for_is_right, comparison_result)) {
+			rv = NumericCast<int64_t>(FORSelectAll(sel, count, true_sel, false_sel, comparison_result));
+			return rv;
+		}
+		uint64_t delta;
+		auto success = FORVector::TryGetDelta(constant, FORVector::GetMin<LT>(*for_vec), delta);
+		D_ASSERT(success);
+		auto sv = FORVector::CreateStoredView(*for_vec);
+		auto st = FORVector::GetStoredType(*for_vec);
+		FOR_SWITCH_STORED(st, S, {
+			Vector cv(Value::CreateValue(UnsafeNumericCast<S>(delta)));
+			auto &l = for_is_right ? cv : sv;
+			auto &r = for_is_right ? sv : cv;
+			rv = NumericCast<int64_t>(
+			    BinaryExecutor::Select<S, S, OP>(l, r, sel.get(), count, true_sel.get(), false_sel.get()));
+		});
+	});
+	return rv;
 }
 template <class OP>
 static idx_t TemplatedSelectOperation(Vector &left, Vector &right, optional_ptr<const SelectionVector> sel, idx_t count,

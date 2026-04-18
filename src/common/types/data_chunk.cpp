@@ -223,6 +223,23 @@ void DataChunk::Append(const DataChunk &other, bool resize, SelectionVector *sel
 		}
 	}
 	for (idx_t i = 0; i < ColumnCount(); i++) {
+		auto &target = data[i];
+		auto &source = other.data[i];
+		if (!sel && source.GetVectorType() == VectorType::FOR_VECTOR) {
+			if (target.GetVectorType() == VectorType::FOR_VECTOR) {
+				if (!FORVector::HasSameMetadata(target, source)) {
+					target.Flatten(size());
+				}
+			} else if (size() == 0) {
+				target.SetVectorType(VectorType::FOR_VECTOR);
+				FOR_SWITCH_LOGICAL(target.GetType().InternalType(), LOGICAL_T, {
+					FORVector::SetMetadata<LOGICAL_T>(target, FORVector::GetStoredType(source),
+					                                  FORVector::GetMax<LOGICAL_T>(source));
+				});
+			}
+		} else if (target.GetVectorType() == VectorType::FOR_VECTOR) {
+			target.Flatten(size());
+		}
 		if (sel) {
 			VectorOperations::Copy(other.data[i], data[i], *sel, sel_count, 0, size());
 		} else {

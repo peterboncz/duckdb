@@ -220,26 +220,55 @@ struct ComparisonExecutor {
 private:
 	template <class OP>
 	static bool TryExecuteFOR(Vector &left, Vector &right, Vector &result, idx_t count) {
-		if (FORVector::TryDispatchComparisonBothFOR(left, right, [&](Vector &lv, Vector &rv, auto tag) {
-			    using S = typename decltype(tag)::type;
-			    BinaryExecutor::Execute<S, S, bool, OP>(lv, rv, result, count);
-			    return true;
-		    }))
+		if (left.GetVectorType() == VectorType::FOR_VECTOR && right.GetVectorType() == VectorType::FOR_VECTOR &&
+		    FORVector::HasSameMetadata(left, right)) {
+			auto lv = FORVector::CreateStoredView(left);
+			auto rv = FORVector::CreateStoredView(right);
+			auto st = FORVector::GetStoredType(left);
+			FOR_SWITCH_STORED(st, S, { BinaryExecutor::Execute<S, S, bool, OP>(lv, rv, result, count); });
 			return true;
-		return FORVector::TryExecuteComparisonConstant<OP>(
-		    left, right, [&](Vector &) { ConstantVector::SetNull(result); },
-		    [&](Vector &fv, bool cmp) {
-			    result.SetVectorType(VectorType::FLAT_VECTOR);
-			    memset(FlatVector::GetDataMutable(result), cmp ? 1 : 0, count);
-			    FlatVector::Validity(result) = FORVector::Validity(fv);
-		    },
-		    [&](Vector &fv, bool for_is_right, auto tag, auto ac) {
-			    using S = typename decltype(tag)::type;
-			    auto sv = FORVector::CreateStoredView(fv);
-			    Vector cv(Value::CreateValue(ac));
-			    auto &l = for_is_right ? cv : sv, &r = for_is_right ? sv : cv;
-			    BinaryExecutor::Execute<S, S, bool, OP>(l, r, result, count);
-		    });
+		}
+		Vector *for_vec = nullptr;
+		Vector *const_vec = nullptr;
+		bool for_is_right = false;
+		if (left.GetVectorType() == VectorType::FOR_VECTOR && right.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+			for_vec = &left;
+			const_vec = &right;
+		} else if (right.GetVectorType() == VectorType::FOR_VECTOR && left.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+			for_vec = &right;
+			const_vec = &left;
+			for_is_right = true;
+		} else {
+			return false;
+		}
+		if (ConstantVector::IsNull(*const_vec)) {
+			ConstantVector::SetNull(result);
+			return true;
+		}
+		auto phys = for_vec->GetType().InternalType();
+		FOR_SWITCH_LOGICAL(phys, LT, {
+			LT constant = ConstantVector::GetData<LT>(*const_vec)[0];
+			auto range = FORVector::RangeAnalysis<LT>(*for_vec, constant);
+			bool comparison_result;
+			if (FORVector::ShortCircuitComparison<OP, LT>(range, for_is_right, comparison_result)) {
+				result.SetVectorType(VectorType::FLAT_VECTOR);
+				memset(FlatVector::GetDataMutable(result), comparison_result ? 1 : 0, count);
+				FlatVector::Validity(result) = FORVector::Validity(*for_vec);
+				return true;
+			}
+			uint64_t delta;
+			auto success = FORVector::TryGetDelta(constant, FORVector::GetMin<LT>(*for_vec), delta);
+			D_ASSERT(success);
+			auto sv = FORVector::CreateStoredView(*for_vec);
+			auto st = FORVector::GetStoredType(*for_vec);
+			FOR_SWITCH_STORED(st, S, {
+				Vector cv(Value::CreateValue(UnsafeNumericCast<S>(delta)));
+				auto &l = for_is_right ? cv : sv;
+				auto &r = for_is_right ? sv : cv;
+				BinaryExecutor::Execute<S, S, bool, OP>(l, r, result, count);
+			});
+		});
+		return true;
 	}
 	template <class T, class OP>
 	static inline void TemplatedExecute(Vector &left, Vector &right, Vector &result, idx_t count) {

@@ -353,80 +353,319 @@ idx_t ColumnData::ScanCount(ColumnScanState &state, Vector &result, idx_t scan_c
 }
 
 //===--------------------------------------------------------------------===//
-// FOR Vector Filter Pushdown
+// Bitmap-based Filter Evaluation
 //===--------------------------------------------------------------------===//
-// Attempt to evaluate a TableFilter directly on a FOR vector's narrow stored data.
-// Returns true if handled, false to fall through to the generic path.
-static bool TryFORFilter(Vector &result, idx_t scan_count, SelectionVector &sel, idx_t &approved_tuple_count,
-                         const TableFilter &filter, TableFilterState &filter_state);
+// Evaluates TableFilter trees directly on contiguous integer data (FOR stored
+// data or native flat columns), producing a bitmap. Multiple predicates are
+// combined via bitwise AND/OR. The bitmap is converted to a SelectionVector
+// only once at the end. Zero allocations in the hot path.
 
-template <class OP>
-static bool TryFORConstantFilter(Vector &result, idx_t scan_count, SelectionVector &sel, idx_t &count,
-                                 const ConstantFilter &cf, TableFilterState &fs) {
-	Vector cv(cf.constant);
-	return FORVector::TryExecuteComparisonConstant<OP>(
-	    result, cv, [&](Vector &) { count = 0; },
-	    [&](Vector &, bool cmp) {
-		    if (!cmp)
-			    count = 0;
-	    },
-	    [&](Vector &fv, bool, auto, auto ac) {
-		    auto sv = FORVector::CreateStoredView(fv);
-		    ConstantFilter adj(cf.comparison_type, Value::CreateValue(ac));
-		    UnifiedVectorFormat vd;
-		    sv.ToUnifiedFormat(scan_count, vd);
-		    ColumnSegment::FilterSelection(sel, sv, vd, adj, fs, scan_count, count);
-	    });
+static constexpr idx_t BM_WORDS = (STANDARD_VECTOR_SIZE + 63) / 64;
+
+static void BitmapSetAll(validity_t *bm) {
+	memset(bm, 0xFF, BM_WORDS * sizeof(validity_t));
 }
-static bool TryFORFilter(Vector &result, idx_t scan_count, SelectionVector &sel, idx_t &count,
-                         const TableFilter &filter, TableFilterState &fs) {
-	if (result.GetVectorType() != VectorType::FOR_VECTOR)
-		return false;
+static void BitmapAnd(validity_t *__restrict dst, const validity_t *__restrict src) {
+	for (idx_t i = 0; i < BM_WORDS; i++) {
+		dst[i] &= src[i];
+	}
+}
+static void BitmapOr(validity_t *__restrict dst, const validity_t *__restrict src) {
+	for (idx_t i = 0; i < BM_WORDS; i++) {
+		dst[i] |= src[i];
+	}
+}
+
+static idx_t BitmapToSel(const validity_t *bm, idx_t count, SelectionVector &sel) {
+	idx_t rc = 0;
+	idx_t nwords = (count + 63) / 64;
+	for (idx_t w = 0; w < nwords; w++) {
+		auto bits = bm[w];
+		idx_t base = w * 64;
+		while (bits) {
+			idx_t pos = base + UnsafeNumericCast<idx_t>(__builtin_ctzll(bits));
+			if (pos < count) {
+				sel.set_index(rc++, pos);
+			}
+			bits &= bits - 1;
+		}
+	}
+	return rc;
+}
+
+// Layer 1: comparison loop — the only hot code.
+// Two-pass: (1) compare to byte array — auto-vectorizes to widest SIMD
+// (NEON: 16× uint8, 8× uint16, 4× uint32, 2× uint64 per instruction).
+// (2) pack bytes into bitmap. The comparison dominates and benefits from SIMD;
+// the packing is a fixed cost on L1-cached data.
+template <class T, class OP>
+static void BitmapCompareOp(const T *__restrict data, T constant, idx_t count, validity_t *__restrict bm) {
+	// Pass 1: compare → byte array (auto-vectorizable, no data dependencies)
+	uint8_t cmp[STANDARD_VECTOR_SIZE];
+	for (idx_t i = 0; i < count; i++) {
+		cmp[i] = OP::Operation(data[i], constant);
+	}
+	// Pass 2: pack 8 comparison bytes → 1 bitmap byte
+	auto *out = reinterpret_cast<uint8_t *>(bm);
+	idx_t full = count / 8;
+	for (idx_t b = 0; b < full; b++) {
+		auto *c = cmp + b * 8;
+		out[b] = c[0] | (c[1] << 1) | (c[2] << 2) | (c[3] << 3) |
+		         (c[4] << 4) | (c[5] << 5) | (c[6] << 6) | (c[7] << 7);
+	}
+	if (full * 8 < count) {
+		uint8_t tail = 0;
+		for (idx_t i = full * 8; i < count; i++) {
+			tail |= cmp[i] << (i - full * 8);
+		}
+		out[full] = tail;
+	}
+}
+
+template <class T>
+static void BitmapCompare(const T *data, T constant, idx_t count, ExpressionType cmp, validity_t *bm) {
+	switch (cmp) {
+	case ExpressionType::COMPARE_EQUAL:
+		BitmapCompareOp<T, Equals>(data, constant, count, bm); break;
+	case ExpressionType::COMPARE_NOTEQUAL:
+		BitmapCompareOp<T, NotEquals>(data, constant, count, bm); break;
+	case ExpressionType::COMPARE_LESSTHAN:
+		BitmapCompareOp<T, LessThan>(data, constant, count, bm); break;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		BitmapCompareOp<T, LessThanEquals>(data, constant, count, bm); break;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		BitmapCompareOp<T, GreaterThan>(data, constant, count, bm); break;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		BitmapCompareOp<T, GreaterThanEquals>(data, constant, count, bm); break;
+	default:
+		break;
+	}
+}
+
+// Layer 2: recursive filter tree evaluation on typed data → bitmap.
+template <class T>
+static bool BitmapEvalFilter(const T *data, idx_t count, const TableFilter &filter, validity_t *result) {
 	switch (filter.filter_type) {
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &cf = filter.Cast<ConstantFilter>();
-		switch (cf.comparison_type) {
-		case ExpressionType::COMPARE_EQUAL:
-			return TryFORConstantFilter<Equals>(result, scan_count, sel, count, cf, fs);
-		case ExpressionType::COMPARE_NOTEQUAL:
-			return TryFORConstantFilter<NotEquals>(result, scan_count, sel, count, cf, fs);
-		case ExpressionType::COMPARE_GREATERTHAN:
-			return TryFORConstantFilter<GreaterThan>(result, scan_count, sel, count, cf, fs);
-		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-			return TryFORConstantFilter<GreaterThanEquals>(result, scan_count, sel, count, cf, fs);
-		case ExpressionType::COMPARE_LESSTHAN:
-			return TryFORConstantFilter<LessThan>(result, scan_count, sel, count, cf, fs);
-		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-			return TryFORConstantFilter<LessThanEquals>(result, scan_count, sel, count, cf, fs);
-		default:
-			return false;
-		}
+		BitmapCompare<T>(data, cf.constant.GetValueUnsafe<T>(), count, cf.comparison_type, result);
+		return true;
 	}
 	case TableFilterType::CONJUNCTION_AND: {
 		auto &conj = filter.Cast<ConjunctionAndFilter>();
-		auto &st = fs.Cast<ConjunctionAndFilterState>();
-		for (idx_t i = 0; i < conj.child_filters.size(); i++)
-			if (!TryFORFilter(result, scan_count, sel, count, *conj.child_filters[i], *st.child_states[i]))
+		BitmapSetAll(result);
+		validity_t child[BM_WORDS];
+		for (auto &ch : conj.child_filters) {
+			if (!BitmapEvalFilter<T>(data, count, *ch, child)) {
 				return false;
+			}
+			BitmapAnd(result, child);
+		}
 		return true;
 	}
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &conj = filter.Cast<ConjunctionOrFilter>();
+		memset(result, 0, sizeof(validity_t) * BM_WORDS);
+		validity_t child[BM_WORDS];
+		for (auto &ch : conj.child_filters) {
+			if (!BitmapEvalFilter<T>(data, count, *ch, child)) {
+				return false;
+			}
+			BitmapOr(result, child);
+		}
+		return true;
+	}
+	case TableFilterType::IS_NOT_NULL:
 	case TableFilterType::IS_NULL:
-	case TableFilterType::IS_NOT_NULL: {
-		UnifiedVectorFormat vd;
-		result.ToUnifiedFormat(scan_count, vd);
-		ColumnSegment::FilterSelection(sel, result, vd, filter, fs, scan_count, count);
+		BitmapSetAll(result);
 		return true;
-	}
 	default:
 		return false;
 	}
 }
+
+// FOR wrapper: adjusts constants from logical type to stored unsigned type.
+template <class LT>
+static bool FORConstantBitmapResult(ExpressionType comparison_type, bool all_gt, bool all_lt) {
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+		return false;
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return true;
+	case ExpressionType::COMPARE_LESSTHAN:
+		return all_lt;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return all_lt;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return all_gt;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return all_gt;
+	default:
+		throw InternalException("Unsupported comparison type for FOR bitmap filter");
+	}
+}
+
+template <class LT, class ST>
+static bool BitmapEvalFilterFOR(const ST *data, idx_t count, const TableFilter &filter, validity_t *result, LT min_value,
+                                LT max_value) {
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &cf = filter.Cast<ConstantFilter>();
+		auto constant = cf.constant.GetValueUnsafe<LT>();
+		auto range = FORVector::RangeAnalysis<LT>(constant, min_value, max_value);
+		if (range.all_gt || range.all_lt) {
+			if (FORConstantBitmapResult<LT>(cf.comparison_type, range.all_gt, range.all_lt)) {
+				BitmapSetAll(result);
+			} else {
+				memset(result, 0, sizeof(validity_t) * BM_WORDS);
+			}
+			return true;
+		}
+		uint64_t delta;
+		if (!FORVector::TryGetDelta(constant, min_value, delta)) {
+			return false;
+		}
+		BitmapCompare<ST>(data, UnsafeNumericCast<ST>(delta), count, cf.comparison_type, result);
+		return true;
+	}
+	case TableFilterType::CONJUNCTION_AND: {
+		auto &conj = filter.Cast<ConjunctionAndFilter>();
+		BitmapSetAll(result);
+		validity_t child[BM_WORDS];
+		for (auto &ch : conj.child_filters) {
+			if (!BitmapEvalFilterFOR<LT, ST>(data, count, *ch, child, min_value, max_value)) {
+				return false;
+			}
+			BitmapAnd(result, child);
+		}
+		return true;
+	}
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &conj = filter.Cast<ConjunctionOrFilter>();
+		memset(result, 0, sizeof(validity_t) * BM_WORDS);
+		validity_t child[BM_WORDS];
+		for (auto &ch : conj.child_filters) {
+			if (!BitmapEvalFilterFOR<LT, ST>(data, count, *ch, child, min_value, max_value)) {
+				return false;
+			}
+			BitmapOr(result, child);
+		}
+		return true;
+	}
+	default:
+		return BitmapEvalFilter<ST>(data, count, filter, result);
+	}
+}
+
+// Layer 3a: FOR vector entry point.
+static bool TryFORBitmapFilter(Vector &result, idx_t count, const TableFilter &filter, validity_t *bitmap) {
+	if (result.GetVectorType() != VectorType::FOR_VECTOR) {
+		return false;
+	}
+	auto phys = result.GetType().InternalType();
+	if (GetTypeIdSize(phys) <= 1) {
+		return false;
+	}
+	FOR_SWITCH_LOGICAL(phys, LT, {
+		auto stored_type = FORVector::GetStoredType(result);
+		auto *data = FORVector::GetData(result);
+		auto min_value = FORVector::GetMin<LT>(result);
+		auto max_value = FORVector::GetMax<LT>(result);
+		FOR_SWITCH_STORED(stored_type, ST, {
+			return BitmapEvalFilterFOR<LT, ST>(reinterpret_cast<const ST *>(data), count, filter, bitmap, min_value,
+			                                  max_value);
+		});
+	});
+}
+
+// Layer 3b: flat integer vector entry point.
+static bool TryFlatBitmapFilter(Vector &result, idx_t count, const TableFilter &filter, validity_t *bitmap) {
+	if (result.GetVectorType() != VectorType::FLAT_VECTOR) {
+		return false;
+	}
+	auto phys = result.GetType().InternalType();
+	auto *data = FlatVector::GetData(result);
+	switch (phys) {
+	case PhysicalType::INT8:
+		return BitmapEvalFilter<int8_t>(reinterpret_cast<const int8_t *>(data), count, filter, bitmap);
+	case PhysicalType::UINT8:
+		return BitmapEvalFilter<uint8_t>(reinterpret_cast<const uint8_t *>(data), count, filter, bitmap);
+	case PhysicalType::INT16:
+		return BitmapEvalFilter<int16_t>(reinterpret_cast<const int16_t *>(data), count, filter, bitmap);
+	case PhysicalType::UINT16:
+		return BitmapEvalFilter<uint16_t>(reinterpret_cast<const uint16_t *>(data), count, filter, bitmap);
+	case PhysicalType::INT32:
+		return BitmapEvalFilter<int32_t>(reinterpret_cast<const int32_t *>(data), count, filter, bitmap);
+	case PhysicalType::UINT32:
+		return BitmapEvalFilter<uint32_t>(reinterpret_cast<const uint32_t *>(data), count, filter, bitmap);
+	default:
+		return false;
+	}
+}
+
 void ColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
                         SelectionVector &sel, idx_t &s_count, const TableFilter &filter,
                         TableFilterState &filter_state) {
 	idx_t scan_count = Scan(transaction, vector_index, state, result);
-	if (TryFORFilter(result, scan_count, sel, s_count, filter, filter_state))
-		return;
+
+	// Bitmap path: FOR vectors or flat narrow integer columns.
+	// For the first column: bitmap is dense (processes all values).
+	// For subsequent columns with FOR vectors: also use bitmap path to preserve
+	// FOR status for downstream expression evaluation (e.g. FOR × FOR arithmetic).
+	// The bitmap evaluation on all 2048 narrow values is cheap; the benefit is
+	// avoiding Flatten which destroys FOR status and forces full-width copies.
+	bool is_first_column = !sel.IsSet() || s_count == scan_count;
+	// For non-first columns: use bitmap when selectivity is above ~6%.
+	// Below that, the generic selective path processes fewer values.
+	bool try_bitmap = is_first_column ||
+	                  (result.GetVectorType() == VectorType::FOR_VECTOR && s_count > scan_count / 16);
+	if (try_bitmap) {
+		validity_t bitmap[BM_WORDS];
+		bool for_bitmap = TryFORBitmapFilter(result, scan_count, filter, bitmap);
+		if (for_bitmap || (is_first_column && TryFlatBitmapFilter(result, scan_count, filter, bitmap))) {
+			// Track FOR bitmap filter statistics
+			if (state.parent) {
+				state.parent->filter_total_tuples += scan_count;
+				if (for_bitmap) {
+					state.parent->for_bitmap_tuples += scan_count;
+				}
+			}
+			idx_t nwords = (scan_count + 63) / 64;
+			// AND with validity mask to exclude NULLs
+			const auto &validity = (result.GetVectorType() == VectorType::FOR_VECTOR)
+			                           ? FORVector::Validity(result)
+			                           : FlatVector::Validity(result);
+			if (!validity.CannotHaveNull()) {
+				for (idx_t i = 0; i < nwords; i++) {
+					bitmap[i] &= validity.GetValidityEntry(i);
+				}
+			}
+			// AND with existing selection (for non-first columns)
+			if (!is_first_column && sel.IsSet()) {
+				// Convert existing sel to bitmap, AND
+				validity_t sel_bitmap[BM_WORDS];
+				memset(sel_bitmap, 0, sizeof(sel_bitmap));
+				for (idx_t i = 0; i < s_count; i++) {
+					auto idx = sel.get_index(i);
+					sel_bitmap[idx / 64] |= validity_t(1) << (idx % 64);
+				}
+				for (idx_t i = 0; i < nwords; i++) {
+					bitmap[i] &= sel_bitmap[i];
+				}
+			}
+			// Convert bitmap → selection vector
+			if (!sel.IsSet()) {
+				sel.Initialize(scan_count);
+			}
+			s_count = BitmapToSel(bitmap, scan_count, sel);
+			return;
+		}
+	}
+
+	// Fallback: existing generic path
+	if (state.parent) {
+		state.parent->filter_total_tuples += scan_count;
+	}
 	UnifiedVectorFormat vdata;
 	result.ToUnifiedFormat(scan_count, vdata);
 	ColumnSegment::FilterSelection(sel, result, vdata, filter, filter_state, scan_count, s_count);
@@ -435,6 +674,30 @@ void ColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnS
 void ColumnData::Select(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
                         SelectionVector &sel, idx_t s_count) {
 	Scan(transaction, vector_index, state, result);
+	// For FOR vectors: gather narrow data in-place instead of creating
+	// DICTIONARY(FOR) which allocates DictionaryBuffer+DictionaryEntry per
+	// chunk. Safe here because filter selections are monotonically increasing
+	// (sel[i] >= i), so the write at position i never overwrites a source
+	// position that hasn't been read yet.
+	if (result.GetVectorType() == VectorType::FOR_VECTOR) {
+		auto stored_type = FORVector::GetStoredType(result);
+		auto *buf = result.GetBuffer()->GetData();
+		FOR_SWITCH_STORED(stored_type, ST, {
+			auto *data = reinterpret_cast<ST *>(buf);
+			for (idx_t i = 0; i < s_count; i++) {
+				data[i] = data[sel.get_index(i)];
+			}
+		});
+		auto &validity = result.GetBuffer()->GetValidityMask();
+		if (validity.CanHaveNull()) {
+			ValidityMask new_validity(s_count);
+			for (idx_t i = 0; i < s_count; i++) {
+				new_validity.Set(i, validity.RowIsValid(sel.get_index(i)));
+			}
+			validity = std::move(new_validity);
+		}
+		return;
+	}
 	result.Slice(sel, s_count);
 }
 

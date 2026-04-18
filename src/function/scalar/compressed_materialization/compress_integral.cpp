@@ -60,17 +60,17 @@ void IntegralCompressFunction(DataChunk &args, ExpressionState &state, Vector &r
 		if (stored_size <= result_size && min_val >= INPUT_TYPE(0) &&
 		    static_cast<uint64_t>(min_val) <= static_cast<uint64_t>(NumericLimits<RESULT_TYPE>::Maximum())) {
 			auto result_data = FlatVector::GetDataMutable<RESULT_TYPE>(result);
-			bool handled = FORVector::DispatchStoredType(stored_type, [&](auto tag) {
-				using STORED_T = typename decltype(tag)::type;
+			bool handled = true;
+			FOR_SWITCH_STORED(stored_type, STORED_T, {
 				auto stored_data = reinterpret_cast<const STORED_T *>(src);
 				if (static_cast<uint64_t>(min_val) > static_cast<uint64_t>(NumericLimits<STORED_T>::Maximum())) {
-					return false; // min_val too large for narrow subtraction
+					handled = false;
+				} else {
+					auto min_narrow = static_cast<STORED_T>(min_val);
+					for (idx_t i = 0; i < count; i++) {
+						result_data[i] = UnsafeNumericCast<RESULT_TYPE>(stored_data[i] - min_narrow);
+					}
 				}
-				auto min_narrow = static_cast<STORED_T>(min_val);
-				for (idx_t i = 0; i < count; i++) {
-					result_data[i] = UnsafeNumericCast<RESULT_TYPE>(stored_data[i] - min_narrow);
-				}
-				return true;
 			});
 			if (handled) {
 				FlatVector::Validity(result) = FORVector::Validity(*for_vec);
@@ -165,27 +165,25 @@ struct TemplatedIntegralDecompress<INPUT_TYPE, uhugeint_t> {
 
 template <class INPUT_TYPE, class RESULT_TYPE>
 void IntegralDecompressFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	D_ASSERT(args.ColumnCount() == 2);
+	D_ASSERT(args.ColumnCount() == 3);
 	D_ASSERT(args.data[1].GetVectorType() == VectorType::CONSTANT_VECTOR);
-	D_ASSERT(args.data[1].GetType() == result.GetType());
+	D_ASSERT(args.data[2].GetVectorType() == VectorType::CONSTANT_VECTOR);
 	const auto min_val = ConstantVector::GetData<RESULT_TYPE>(args.data[1])[0];
 	auto &input_vec = args.data[0];
 	auto count = args.size();
 
-	if (sizeof(RESULT_TYPE) > sizeof(INPUT_TYPE) && min_val >= RESULT_TYPE(0) && count > 1) {
+	if (sizeof(RESULT_TYPE) > sizeof(INPUT_TYPE) && count > 1) {
 		auto input_phys = input_vec.GetType().InternalType();
 		// Only produce FOR if input is strictly narrower than result
-		if (GetTypeIdSize(input_phys) < sizeof(RESULT_TYPE)) {
-			auto max_value = TemplatedIntegralDecompress<INPUT_TYPE, RESULT_TYPE>::Operation(
-			    NumericLimits<INPUT_TYPE>::Maximum(), min_val);
+		if (GetTypeIdSize(input_phys) < sizeof(RESULT_TYPE) && min_val >= RESULT_TYPE(0)) {
+			const auto max_val = ConstantVector::GetData<RESULT_TYPE>(args.data[2])[0];
 			PhysicalType stored_phys;
-			if (FORVector::TryGetStoredTypeForMax<RESULT_TYPE>(max_value, stored_phys)) {
+			if (FORVector::TryGetStoredTypeForMax<RESULT_TYPE>(max_val, stored_phys)) {
 				input_vec.Flatten(count);
-				FORVector::Create<RESULT_TYPE>(result, stored_phys, max_value);
+				FORVector::Create<RESULT_TYPE>(result, stored_phys, max_val);
 				FORVector::Validity(result) = FlatVector::Validity(input_vec);
-				FORVector::DispatchStoredType(stored_phys, [&](auto tag) {
-					using STORED_T = typename decltype(tag)::type;
-					auto input_data = FlatVector::GetData<INPUT_TYPE>(input_vec);
+				auto input_data = FlatVector::GetData<INPUT_TYPE>(input_vec);
+				FOR_SWITCH_STORED(stored_phys, STORED_T, {
 					auto result_data = reinterpret_cast<STORED_T *>(FORVector::GetData(result));
 					for (idx_t i = 0; i < count; i++) {
 						result_data[i] = UnsafeNumericCast<STORED_T>(
@@ -301,7 +299,7 @@ ScalarFunction CMIntegralCompressFun::GetFunction(const LogicalType &input_type,
 }
 
 ScalarFunction CMIntegralDecompressFun::GetFunction(const LogicalType &input_type, const LogicalType &result_type) {
-	ScalarFunction result(IntegralDecompressFunctionName(result_type), {input_type, result_type}, result_type,
+	ScalarFunction result(IntegralDecompressFunctionName(result_type), {input_type, result_type, result_type}, result_type,
 	                      GetIntegralDecompressFunctionInputSwitch(input_type, result_type), CMUtils::Bind);
 	result.SetSerializeCallback(CMIntegralSerialize);
 	result.SetDeserializeCallback(CMIntegralDeserialize<GetIntegralDecompressFunctionInputSwitch>);

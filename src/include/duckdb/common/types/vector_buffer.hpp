@@ -92,6 +92,19 @@ public:
 		return nullptr;
 	}
 
+	//! Inline FOR vector metadata — avoids per-chunk heap allocation.
+	//! Only meaningful when the vector has VectorType::FOR_VECTOR.
+	//! Logical value is stored directly in the payload, and max tracks the largest payload value.
+	PhysicalType for_stored_type = PhysicalType::INVALID;
+	uhugeint_t for_max_value = 0;
+	//! True when this buffer is managed by a VectorCache. Allows Flatten
+	//! to widen FOR data in-place at use_count==2 (one ref from cache,
+	//! one from vector) without allocating a new buffer.
+	bool cache_owned = false;
+	//! Cached flatten buffer — reused across iterations to avoid per-chunk
+	//! malloc/free in the Flatten-before-Slice path for FOR vectors.
+	buffer_ptr<VectorBuffer> flatten_cache;
+
 	static buffer_ptr<VectorBuffer> CreateStandardVector(PhysicalType type, idx_t capacity = STANDARD_VECTOR_SIZE);
 	static buffer_ptr<VectorBuffer> CreateConstantVector(PhysicalType type);
 	static buffer_ptr<VectorBuffer> CreateConstantVector(const LogicalType &logical_type);

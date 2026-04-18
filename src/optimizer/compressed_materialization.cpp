@@ -377,7 +377,21 @@ unique_ptr<CompressExpression> CompressedMaterialization::GetIntegralCompress(un
 			cast_type = LogicalType::UBIGINT;
 		}
 
-		min = NumericStats::Min(stats);
+		// If max already fits in cast_type, skip the min subtraction entirely.
+		// This makes compress a pure narrowing cast (no subtract) and decompress
+		// a pure widening cast (no add) — and makes the FOR compress path a no-op.
+		auto max_value = NumericStats::Max(stats);
+		Value max_as_ubigint = max_value;
+		if (max_as_ubigint.DefaultTryCastAs(LogicalType::UBIGINT)) {
+			auto max_u = UBigIntValue::Get(max_as_ubigint);
+			auto cast_max = (GetTypeIdSize(cast_type.InternalType()) == 1) ? NumericLimits<uint8_t>::Maximum()
+			              : (GetTypeIdSize(cast_type.InternalType()) == 2) ? NumericLimits<uint16_t>::Maximum()
+			              : (GetTypeIdSize(cast_type.InternalType()) == 4) ? (uint64_t)NumericLimits<uint32_t>::Maximum()
+			                                                               : NumericLimits<uint64_t>::Maximum();
+			min = (max_u <= cast_max) ? Value(0).DefaultCastAs(type) : NumericStats::Min(stats);
+		} else {
+			min = NumericStats::Min(stats);
+		}
 	} else {
 		// We don't have enough stats to do anything
 		return nullptr;
@@ -485,10 +499,12 @@ unique_ptr<Expression> CompressedMaterialization::GetIntegralDecompress(unique_p
 	D_ASSERT(!stats.CanHaveNoNull() || NumericStats::HasMinMax(stats));
 	auto decompress_function = CMIntegralDecompressFun::GetFunction(input->return_type, result_type);
 	const auto min = !stats.CanHaveNoNull() ? Value(result_type) : NumericStats::Min(stats);
+	const auto max = !stats.CanHaveNoNull() ? Value(result_type) : NumericStats::Max(stats);
 
 	vector<unique_ptr<Expression>> arguments;
 	arguments.emplace_back(std::move(input));
 	arguments.emplace_back(make_uniq<BoundConstantExpression>(min));
+	arguments.emplace_back(make_uniq<BoundConstantExpression>(max));
 	return make_uniq<BoundFunctionExpression>(result_type, decompress_function, std::move(arguments), nullptr);
 }
 

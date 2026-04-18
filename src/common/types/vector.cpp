@@ -280,13 +280,17 @@ void Vector::Slice(const SelectionVector &sel, idx_t count) {
 		return;
 	}
 
-	Vector child_vector(Vector::Ref(*this));
 	if (GetVectorType() == VectorType::FOR_VECTOR) {
-		auto entry = make_shared_ptr<DictionaryEntry>(std::move(child_vector));
-		buffer = make_buffer<DictionaryBuffer>(sel, std::move(entry));
-		vector_type = VectorType::DICTIONARY_VECTOR;
-		return;
+		// Flatten FOR→FLAT before creating DICTIONARY. For exclusive ownership
+		// (use_count==1): zero-allocation backward widen. For shared buffers:
+		// allocates once, but the resulting DICTIONARY(FLAT) is zero-copy for
+		// all downstream ToUnifiedFormat calls — far cheaper than leaving
+		// DICTIONARY(FOR) which decompresses on every access.
+		Flatten(STANDARD_VECTOR_SIZE);
+		// Fall through to create DICTIONARY(FLAT) below
 	}
+
+	Vector child_vector(Vector::Ref(*this));
 
 	if (internal_type == PhysicalType::STRUCT) {
 		// structs should not be sliced themselves - only their children are sliced
@@ -1137,10 +1141,37 @@ void Vector::Flatten(idx_t count) const {
 		break;
 	}
 	case VectorType::FOR_VECTOR: {
-		Vector flattened_vector(GetType(), MaxValue<idx_t>(STANDARD_VECTOR_SIZE, count));
-		FORVector::Decompress(*this, flattened_vector, count);
-		FlatVector::Validity(flattened_vector) = FORVector::Validity(*this);
-		ConstReference(flattened_vector);
+		if (buffer.use_count() == 1 + buffer->cache_owned) {
+			// No other vector references this buffer (cache_owned accounts for
+			// the VectorCache's ref). Safe to decompress in-place.
+			auto stored_type = FORVector::GetStoredType(*this);
+			auto *buf = buffer->GetData();
+			FOR_SWITCH_LOGICAL(type.InternalType(), LT, {
+				FOR_SWITCH_STORED(stored_type, ST, {
+					auto *src = reinterpret_cast<const ST *>(buf);
+					auto *dst = reinterpret_cast<LT *>(buf);
+					for (idx_t j = count; j-- > 0;) {
+						dst[j] = FORVector::WidenStored<LT, ST>(src[j]);
+					}
+				});
+			});
+			vector_type = VectorType::FLAT_VECTOR;
+		} else {
+			// Shared buffer: decompress into a separate flat buffer.
+			// Reuse cached flatten buffer if available (avoids per-chunk malloc).
+			// Reuse cached flatten buffer if available (avoids per-chunk malloc).
+			// Move (not copy) to prevent two Flatten calls from sharing the same buffer.
+			auto cached = buffer->flatten_cache ? std::move(buffer->flatten_cache) : buffer_ptr<VectorBuffer>();
+			if (cached) {
+				cached->GetValidityMask().Reset();
+			}
+			Vector flattened_vector = cached
+			    ? Vector(GetType(), VectorType::FLAT_VECTOR, std::move(cached))
+			    : Vector(GetType(), MaxValue<idx_t>(STANDARD_VECTOR_SIZE, count));
+			FORVector::Decompress(*this, flattened_vector, count);
+			FlatVector::Validity(flattened_vector) = FORVector::Validity(*this);
+			ConstReference(flattened_vector);
+		}
 		break;
 	}
 	default:
@@ -1212,11 +1243,32 @@ void Vector::ToUnifiedFormat(idx_t count, UnifiedVectorFormat &format) const {
 		if (child.GetVectorType() == VectorType::FLAT_VECTOR) {
 			format.data = FlatVector::GetData(child);
 			format.validity = FlatVector::Validity(child);
+		} else if (child.GetVectorType() == VectorType::FOR_VECTOR) {
+			// DICTIONARY(FOR): decompress narrow→wide directly into format.owned_data.
+			// Reuse the buffer if already allocated (common when the UnifiedVectorFormat
+			// persists across chunks, e.g. in TupleDataChunkState). This avoids the
+			// per-chunk malloc+free that Ref+Flatten would cause (use_count > 1 fallback).
+			auto type_size = GetTypeIdSize(type.InternalType());
+			if (!format.owned_data) {
+				format.owned_data =
+				    make_buffer<StandardVectorBuffer>(STANDARD_VECTOR_SIZE, type_size);
+			}
+			auto *dst = format.owned_data->GetData();
+			auto stored_type = FORVector::GetStoredType(child);
+			auto *src = FORVector::GetData(child);
+			FOR_SWITCH_LOGICAL(type.InternalType(), LT, {
+				FOR_SWITCH_STORED(stored_type, ST, {
+					auto *s = reinterpret_cast<const ST *>(src);
+					auto *d = reinterpret_cast<LT *>(dst);
+					for (idx_t i = 0; i < STANDARD_VECTOR_SIZE; i++) {
+						d[i] = FORVector::WidenStored<LT, ST>(s[i]);
+					}
+				});
+			});
+			format.data = dst;
+			format.validity = FORVector::Validity(child);
 		} else {
-			// dictionary with non-flat child (e.g. FOR): flatten fully so data stays indexed
-			// by original positions. Store in format.owned_data to keep alive WITHOUT modifying
-			// this->buffer — otherwise other expressions referencing the same input vector
-			// would see the flattened (FLAT) version instead of the original DICTIONARY(FOR).
+			// dictionary with non-flat, non-FOR child: flatten fully.
 			Vector child_vector(Vector::Ref(child));
 			child_vector.Flatten(STANDARD_VECTOR_SIZE);
 

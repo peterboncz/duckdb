@@ -247,6 +247,13 @@ public:
 	optional_idx row_number_base;
 	//! The valid selection
 	SelectionVector valid_sel;
+	//! Reusable selection vector for filter evaluation (avoids per-chunk allocation)
+	SelectionVector filter_sel;
+
+	//! FOR bitmap filter statistics: tuples×columns processed via FOR bitmap path
+	idx_t for_bitmap_tuples = 0;
+	//! Total tuples×columns processed in predicate evaluation
+	idx_t filter_total_tuples = 0;
 
 	RandomEngine random;
 

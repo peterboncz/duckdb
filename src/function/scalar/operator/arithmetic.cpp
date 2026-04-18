@@ -115,14 +115,22 @@ static scalar_function_t GetFORArithmeticFunction(PhysicalType type) {
 	if (!TypeIsIntegral(type) || GetTypeIdSize(type) <= 1) {
 		return GetScalarIntegerFunction<OP>(type);
 	}
-	switch (GetTypeIdSize(type)) {
-	case sizeof(uint16_t):
+	switch (type) {
+	case PhysicalType::INT16:
+		return &FORArithmeticDomainFunction<int16_t, OP>;
+	case PhysicalType::INT32:
+		return &FORArithmeticDomainFunction<int32_t, OP>;
+	case PhysicalType::INT64:
+		return &FORArithmeticDomainFunction<int64_t, OP>;
+	case PhysicalType::INT128:
+		return &FORArithmeticDomainFunction<hugeint_t, OP>;
+	case PhysicalType::UINT16:
 		return &FORArithmeticDomainFunction<uint16_t, OP>;
-	case sizeof(uint32_t):
+	case PhysicalType::UINT32:
 		return &FORArithmeticDomainFunction<uint32_t, OP>;
-	case sizeof(uint64_t):
+	case PhysicalType::UINT64:
 		return &FORArithmeticDomainFunction<uint64_t, OP>;
-	case sizeof(uhugeint_t):
+	case PhysicalType::UINT128:
 		return &FORArithmeticDomainFunction<uhugeint_t, OP>;
 	default:
 		return GetScalarIntegerFunction<OP>(type);
