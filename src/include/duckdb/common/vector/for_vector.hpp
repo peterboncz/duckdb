@@ -8,17 +8,14 @@
 
 #pragma once
 
-#include "duckdb/common/types/hugeint.hpp"
-#include "duckdb/common/vector/constant_vector.hpp"
-#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/for_vector_helpers.hpp"
 
 namespace duckdb {
 
-//! FORVector: compressed vector backed by smaller unsigned integer delta payload values.
-//! Stores logical values as min + delta, where min lives in metadata and delta is stored
-//! in the vector payload using UINT8/16/32/64.
+//! FORVector: compressed vector backed by smaller unsigned integer payload values.
+//! Stores non-negative logical values directly in the vector payload using UINT8/16/32/64.
 //!
 //! Layout: the narrow stored data lives inside the vector's existing buffer (e.g. a
 //! StandardVectorBuffer). The metadata (max value, stored type) lives in auxiliary data.
@@ -29,189 +26,6 @@ namespace duckdb {
 struct FORRangeResult {
 	bool all_gt; //! all FOR values > constant
 	bool all_lt; //! all FOR values < constant
-};
-
-//! Type tag for compile-time type dispatch in DispatchLogicalType.
-template <class T>
-struct FORTypeTag {
-	using type = T;
-};
-
-#define FOR_SWITCH_LOGICAL(TYPE, TYPE_NAME, ...)                                                                      \
-	switch (TYPE) {                                                                                                  \
-	case PhysicalType::INT16: {                                                                                      \
-		typedef int16_t TYPE_NAME;                                                                                   \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	case PhysicalType::INT32: {                                                                                      \
-		typedef int32_t TYPE_NAME;                                                                                   \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	case PhysicalType::INT64: {                                                                                      \
-		typedef int64_t TYPE_NAME;                                                                                   \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	case PhysicalType::INT128: {                                                                                     \
-		typedef hugeint_t TYPE_NAME;                                                                                 \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	case PhysicalType::UINT16: {                                                                                     \
-		typedef uint16_t TYPE_NAME;                                                                                  \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	case PhysicalType::UINT32: {                                                                                     \
-		typedef uint32_t TYPE_NAME;                                                                                  \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	case PhysicalType::UINT64: {                                                                                     \
-		typedef uint64_t TYPE_NAME;                                                                                  \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	case PhysicalType::UINT128: {                                                                                    \
-		typedef uhugeint_t TYPE_NAME;                                                                                \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	default:                                                                                                         \
-		throw InternalException("Unsupported logical type for FOR vector dispatch: %s", TypeIdToString(TYPE));       \
-	}
-
-#define FOR_SWITCH_STORED(TYPE, TYPE_NAME, ...)                                                                       \
-	switch (TYPE) {                                                                                                  \
-	case PhysicalType::UINT8: {                                                                                      \
-		typedef uint8_t TYPE_NAME;                                                                                   \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	case PhysicalType::UINT16: {                                                                                     \
-		typedef uint16_t TYPE_NAME;                                                                                  \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	case PhysicalType::UINT32: {                                                                                     \
-		typedef uint32_t TYPE_NAME;                                                                                  \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	case PhysicalType::UINT64: {                                                                                     \
-		typedef uint64_t TYPE_NAME;                                                                                  \
-		__VA_ARGS__;                                                                                                 \
-		break;                                                                                                       \
-	}                                                                                                                \
-	default:                                                                                                         \
-		throw InternalException("Unsupported stored type for FOR vector dispatch: %s", TypeIdToString(TYPE));        \
-	}
-
-template <class T>
-struct FORUnsignedType {
-	using type = typename MakeUnsigned<T>::type;
-};
-template <>
-struct FORUnsignedType<hugeint_t> {
-	using type = uhugeint_t;
-};
-
-template <class T, bool IS_SIGNED = NumericLimits<T>::IsSigned()>
-struct FORValueOps;
-
-template <class T>
-struct FORValueOps<T, false> {
-	static inline uhugeint_t ToUnsignedStorage(T value) {
-		return uhugeint_t(UnsafeNumericCast<uint64_t>(value));
-	}
-	static inline T FromUnsignedStorage(const uhugeint_t &value) {
-		return UnsafeNumericCast<T>(value.lower);
-	}
-	static inline T AddDelta(T min_value, uint64_t delta) {
-		return UnsafeNumericCast<T>(uhugeint_t(min_value) + uhugeint_t(delta));
-	}
-	static inline bool TryGetDelta(T value, T min_value, uint64_t &delta) {
-		if (value < min_value) {
-			return false;
-		}
-		delta = UnsafeNumericCast<uint64_t>(value - min_value);
-		return true;
-	}
-};
-
-template <class T>
-struct FORValueOps<T, true> {
-	static inline uhugeint_t ToUnsignedStorage(T value) {
-		return static_cast<uhugeint_t>(Hugeint::Convert(value));
-	}
-	static inline T FromUnsignedStorage(const uhugeint_t &value) {
-		return UnsafeNumericCast<T>(static_cast<hugeint_t>(value));
-	}
-	static inline T AddDelta(T min_value, uint64_t delta) {
-		return UnsafeNumericCast<T>(Hugeint::Convert(min_value) + hugeint_t(0, delta));
-	}
-	static inline bool TryGetDelta(T value, T min_value, uint64_t &delta) {
-		if (value < min_value) {
-			return false;
-		}
-		auto diff = Hugeint::Subtract(Hugeint::Convert(value), Hugeint::Convert(min_value));
-		auto udiff = static_cast<uhugeint_t>(diff);
-		if (udiff.upper != 0) {
-			return false;
-		}
-		delta = udiff.lower;
-		return true;
-	}
-};
-
-template <>
-struct FORValueOps<hugeint_t, true> {
-	static inline uhugeint_t ToUnsignedStorage(hugeint_t value) {
-		return static_cast<uhugeint_t>(value);
-	}
-	static inline hugeint_t FromUnsignedStorage(const uhugeint_t &value) {
-		return static_cast<hugeint_t>(value);
-	}
-	static inline hugeint_t AddDelta(hugeint_t min_value, uint64_t delta) {
-		return min_value + hugeint_t(0, delta);
-	}
-	static inline bool TryGetDelta(hugeint_t value, hugeint_t min_value, uint64_t &delta) {
-		if (value < min_value) {
-			return false;
-		}
-		auto udiff = static_cast<uhugeint_t>(value - min_value);
-		if (udiff.upper != 0) {
-			return false;
-		}
-		delta = udiff.lower;
-		return true;
-	}
-};
-
-template <>
-struct FORValueOps<uhugeint_t, false> {
-	static inline uhugeint_t ToUnsignedStorage(uhugeint_t value) {
-		return value;
-	}
-	static inline uhugeint_t FromUnsignedStorage(const uhugeint_t &value) {
-		return value;
-	}
-	static inline uhugeint_t AddDelta(uhugeint_t min_value, uint64_t delta) {
-		return min_value + uhugeint_t(delta);
-	}
-	static inline bool TryGetDelta(uhugeint_t value, uhugeint_t min_value, uint64_t &delta) {
-		if (value < min_value) {
-			return false;
-		}
-		auto diff = value - min_value;
-		if (diff.upper != 0) {
-			return false;
-		}
-		delta = diff.lower;
-		return true;
-	}
 };
 
 struct FORVector {
@@ -332,56 +146,35 @@ struct FORVector {
 		return vector.buffer->GetValidityMask();
 	}
 
-	template <class T>
-	static inline T GetMin(const Vector &) {
-		return T(0);
-	}
-
-	template <class T>
-	static inline T AddDelta(T min_value, uint64_t delta) {
-		return FORValueOps<T>::AddDelta(min_value, delta);
-	}
-
-	template <class T>
-	static inline bool TryGetDelta(T value, T min_value, uint64_t &delta) {
-		return FORValueOps<T>::TryGetDelta(value, min_value, delta);
-	}
-
 	//! Get the max logical value stored in metadata.
 	template <class T>
 	static T GetMax(const Vector &vector);
 
-	//! Set FOR metadata (stored_type + max) in auxiliary data.
+	//! Set FOR metadata for values in [0, max].
 	template <class T>
 	static void SetMetadata(Vector &vector, PhysicalType stored_type, T max_value);
-
-	template <class T>
-	static inline void SetMetadata(Vector &vector, PhysicalType stored_type, T min_value, uint8_t range_bits) {
-		auto max_value = AddDelta(min_value, range_bits >= 64 ? NumericLimits<uint64_t>::Maximum()
-		                                                      : (range_bits == 0 ? 0 : ((uint64_t(1) << range_bits) - 1)));
-		SetMetadata<T>(vector, stored_type, max_value);
-	}
 
 	//! Decompress a FOR vector into a flat vector
 	static void Decompress(const Vector &source, Vector &target, idx_t count);
 	//! Decompress a FOR vector into a flat vector with selection vector
 	static void Decompress(const Vector &source, Vector &target, const SelectionVector &sel, idx_t count);
+	//! Widen raw FOR payload into a flat target buffer.
+	static void WidenToFlat(const LogicalType &type, PhysicalType stored_type, const_data_ptr_t source,
+	                        data_ptr_t target, const SelectionVector &sel, idx_t count);
 	//! Copy FOR narrow data directly to a FLAT target, widening per element.
 	//! Avoids the allocating Flatten path when use_count > 1.
-	static void CopyToFlat(const Vector &source, const SelectionVector &sel, Vector &target,
-	                        idx_t source_offset, idx_t target_offset, idx_t copy_count);
+	static void CopyToFlat(const Vector &source, const SelectionVector &sel, Vector &target, idx_t source_offset,
+	                       idx_t target_offset, idx_t copy_count);
+	//! Read a single logical value from raw FOR payload.
+	static Value GetValue(const LogicalType &type, PhysicalType stored_type, const_data_ptr_t data, idx_t index);
 
 	//! Create a FOR vector. Reuses the existing buffer — does NOT allocate.
 	//! Caller must write narrow stored data into GetData(vector) after this call.
 	template <class T>
 	static void Create(Vector &vector, PhysicalType stored_type, T max_value);
 
-	template <class T>
-	static inline void Create(Vector &vector, PhysicalType stored_type, T min_value, uint8_t range_bits) {
-		vector.vector_type = VectorType::FOR_VECTOR;
-		vector.buffer->GetValidityMask().Reset();
-		SetMetadata<T>(vector, stored_type, min_value, range_bits);
-	}
+	//! Preserve FOR layout across chunk append where possible; otherwise flatten the target first.
+	static void PrepareAppend(Vector &target, const Vector &source, bool has_selection, idx_t target_size);
 
 	//===--------------------------------------------------------------------===//
 	// Shared helpers — used by comparison, filter pushdown, and arithmetic
@@ -389,6 +182,8 @@ struct FORVector {
 
 	//! Map stored PhysicalType to its LogicalType (UINT8→UTINYINT, etc.)
 	static LogicalType StoredTypeToLogical(PhysicalType stored_type);
+	//! Create a temporary FLAT_VECTOR view over a narrow FOR payload buffer.
+	static Vector CreatePayloadView(PhysicalType stored_type, data_ptr_t payload, idx_t count);
 
 	template <class LOGICAL_T>
 	static bool TryGetStoredTypeForMax(LOGICAL_T max_value, PhysicalType &stored_type) {
@@ -459,19 +254,8 @@ struct FORVector {
 	}
 
 	template <class LOGICAL_T>
-	static FORRangeResult RangeAnalysis(LOGICAL_T constant, LOGICAL_T min_value, LOGICAL_T max_value) {
-		if (constant < min_value) {
-			return {true, false};
-		}
-		if (constant > max_value) {
-			return {false, true};
-		}
-		return {false, false};
-	}
-
-	template <class LOGICAL_T>
 	static FORRangeResult RangeAnalysis(const Vector &for_vec, LOGICAL_T constant) {
-		return RangeAnalysis<LOGICAL_T>(constant, GetMin<LOGICAL_T>(for_vec), GetMax<LOGICAL_T>(for_vec));
+		return RangeAnalysis<LOGICAL_T>(constant, GetMax<LOGICAL_T>(for_vec));
 	}
 
 	template <class OP, class LOGICAL_T>
@@ -495,7 +279,7 @@ struct FORVector {
 		}
 		T max_value = data[0];
 		for (idx_t i = 0; i < count; i++) {
-			if (NumericLimits<T>::IsSigned() && data[i] < 0) {
+			if (NumericLimits<T>::IsSigned() && data[i] < T(0)) {
 				return false;
 			}
 			max_value = MaxValue(max_value, data[i]);
@@ -519,6 +303,10 @@ struct FORVector {
 		return GetStoredType(left) == GetStoredType(right);
 	}
 
+	//! Reference a flat vector containing FOR payload as a FOR vector without copying the data.
+	template <class T>
+	static bool TryReferencePayload(Vector &source, Vector &result, PhysicalType stored_type, T max_value, idx_t count);
+
 	//! Transfer FOR metadata to a wider logical type (e.g. int64 FOR → int128 FOR).
 	//! Shares the buffer via shared_ptr — zero data copy.
 	static bool TryWidenType(Vector &source, Vector &result);
@@ -534,92 +322,6 @@ struct FORVector {
 		return static_cast<LOGICAL_T>(val);
 	}
 };
-
-//===--------------------------------------------------------------------===//
-// FOR arithmetic: operates on narrow stored data, producing narrow FOR result
-//===--------------------------------------------------------------------===//
-template <class LOGICAL_T, class OP, class BOUNDS>
-static inline bool TryFORArithmetic(Vector &left, Vector &right, Vector &result, idx_t count) {
-	struct Operand {
-		bool is_for = false;
-		LOGICAL_T constant_value {};
-		LOGICAL_T max_value {};
-		FORVector::ScanData<LOGICAL_T> scan_data;
-	};
-	auto get_operand = [](Vector &vector, Operand &op) {
-		op.is_for = FORVector::TryGetScanData(vector, op.scan_data);
-		if (op.is_for) {
-			op.max_value = op.scan_data.max_value;
-			return true;
-		}
-		if (vector.GetVectorType() != VectorType::CONSTANT_VECTOR || ConstantVector::IsNull(vector)) {
-			return false;
-		}
-		using SIGNED_T = typename MakeSigned<LOGICAL_T>::type;
-		auto val = ConstantVector::GetDataUnsafe<SIGNED_T>(vector)[0];
-		if (val < 0) {
-			return false;
-		}
-		op.constant_value = static_cast<LOGICAL_T>(val);
-		op.max_value = op.constant_value;
-		return true;
-	};
-
-	Operand lop, rop;
-	if (!get_operand(left, lop) || !get_operand(right, rop) || (!lop.is_for && !rop.is_for)) {
-		return false;
-	}
-	LOGICAL_T result_max;
-	if (!BOUNDS::template Operation<LOGICAL_T>(lop.max_value, rop.max_value, result_max)) {
-		return false;
-	}
-	PhysicalType rst;
-	if (!FORVector::TryGetStoredTypeForMax<LOGICAL_T>(result_max, rst)) {
-		return false;
-	}
-
-	FORVector::Create<LOGICAL_T>(result, rst, result_max);
-	FORVector::CopyResultValidity(result, lop.is_for ? &lop.scan_data : nullptr, rop.is_for ? &rop.scan_data : nullptr,
-	                              count);
-	auto payload = FORVector::GetData(result);
-
-	FOR_SWITCH_STORED(rst, RS, {
-		auto rdata = reinterpret_cast<RS *>(payload);
-		if (!lop.is_for) {
-			FOR_SWITCH_STORED(rop.scan_data.stored_type, S, {
-				unsafe_unique_array<data_t> buf;
-				auto rhs = FORVector::CompactData<S>(rop.scan_data, count, buf);
-				for (idx_t i = 0; i < count; i++) {
-					rdata[i] = OP::template Operation<RS, S, RS>(UnsafeNumericCast<RS>(lop.constant_value), rhs[i]);
-				}
-				return true;
-			});
-		}
-		if (!rop.is_for) {
-			FOR_SWITCH_STORED(lop.scan_data.stored_type, S, {
-				unsafe_unique_array<data_t> buf;
-				auto lhs = FORVector::CompactData<S>(lop.scan_data, count, buf);
-				for (idx_t i = 0; i < count; i++) {
-					rdata[i] = OP::template Operation<S, RS, RS>(lhs[i], UnsafeNumericCast<RS>(rop.constant_value));
-				}
-				return true;
-			});
-		}
-		FOR_SWITCH_STORED(lop.scan_data.stored_type, LS, {
-			unsafe_unique_array<data_t> lbuf;
-			auto ld = FORVector::CompactData<LS>(lop.scan_data, count, lbuf);
-			FOR_SWITCH_STORED(rop.scan_data.stored_type, RRS, {
-				unsafe_unique_array<data_t> rbuf;
-				auto rd = FORVector::CompactData<RRS>(rop.scan_data, count, rbuf);
-				for (idx_t i = 0; i < count; i++) {
-					rdata[i] = OP::template Operation<LS, RRS, RS>(ld[i], rd[i]);
-				}
-				return true;
-			});
-		});
-	});
-	return true;
-}
 
 // Specializations for hugeint_t/uhugeint_t: construct from (0, val)
 #define FOR_WIDEN_HUGEINT(LOGICAL, STORED)                                                                             \

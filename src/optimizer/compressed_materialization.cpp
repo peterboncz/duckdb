@@ -2,6 +2,7 @@
 
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar/compressed_materialization_utils.hpp"
+#include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/function/scalar/operators.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -63,9 +64,11 @@ void CompressedMaterialization::UpdateBindingInfo(CompressedMaterializationInfo 
 
 	auto &binding_info = binding_it->second;
 	binding_info.needs_decompression = needs_decompression;
-	auto stats_it = statistics_map.find(binding);
-	if (stats_it != statistics_map.end()) {
-		binding_info.stats = statistics_map[binding]->ToUnique();
+	if (!binding_info.stats) {
+		auto stats_it = statistics_map.find(binding);
+		if (stats_it != statistics_map.end() && stats_it->second) {
+			binding_info.stats = stats_it->second->ToUnique();
+		}
 	}
 }
 
@@ -309,7 +312,7 @@ unique_ptr<CompressExpression> CompressedMaterialization::GetCompressExpression(
 
 unique_ptr<CompressExpression> CompressedMaterialization::GetCompressExpression(unique_ptr<Expression> input,
                                                                                 const BaseStatistics &stats) {
-	const auto &type = input->return_type;
+	const auto &type = input->GetReturnType();
 	if (type != stats.GetType()) { // LCOV_EXCL_START
 		return nullptr;
 	} // LCOV_EXCL_STOP
@@ -331,10 +334,11 @@ static Value GetIntegralRangeValue(ClientContext &context, const LogicalType &ty
 	vector<unique_ptr<Expression>> arguments;
 	arguments.emplace_back(make_uniq<BoundConstantExpression>(max));
 	arguments.emplace_back(make_uniq<BoundConstantExpression>(min));
-	BoundFunctionExpression sub(type, SubtractFunction::GetFunction(type, type), std::move(arguments), nullptr);
+
+	auto sub = SubtractFunction::GetFunction(type, type).Bind(context, std::move(arguments));
 
 	Value result;
-	if (ExpressionExecutor::TryEvaluateScalar(context, sub, result)) {
+	if (ExpressionExecutor::TryEvaluateScalar(context, *sub, result)) {
 		return result;
 	} else {
 		// Couldn't evaluate: Return max uhugeint as range so GetIntegralCompress will return nullptr
@@ -344,7 +348,7 @@ static Value GetIntegralRangeValue(ClientContext &context, const LogicalType &ty
 
 unique_ptr<CompressExpression> CompressedMaterialization::GetIntegralCompress(unique_ptr<Expression> input,
                                                                               const BaseStatistics &stats) {
-	const auto &type = input->return_type;
+	const auto &type = input->GetReturnType();
 	if (GetTypeIdSize(type.InternalType()) == 1) {
 		return nullptr;
 	}
@@ -356,7 +360,7 @@ unique_ptr<CompressExpression> CompressedMaterialization::GetIntegralCompress(un
 		// All NULL
 		cast_type = LogicalType::UTINYINT;
 		range_value = Value::UTINYINT(0);
-		min = Value(input->return_type);
+		min = Value(input->GetReturnType());
 	} else if (NumericStats::HasMinMax(stats)) {
 		// Get range and cast to UBIGINT (might fail for HUGEINT, in which case we just return)
 		range_value = GetIntegralRangeValue(context, type, stats);
@@ -377,21 +381,7 @@ unique_ptr<CompressExpression> CompressedMaterialization::GetIntegralCompress(un
 			cast_type = LogicalType::UBIGINT;
 		}
 
-		// If max already fits in cast_type, skip the min subtraction entirely.
-		// This makes compress a pure narrowing cast (no subtract) and decompress
-		// a pure widening cast (no add) — and makes the FOR compress path a no-op.
-		auto max_value = NumericStats::Max(stats);
-		Value max_as_ubigint = max_value;
-		if (max_as_ubigint.DefaultTryCastAs(LogicalType::UBIGINT)) {
-			auto max_u = UBigIntValue::Get(max_as_ubigint);
-			auto cast_max = (GetTypeIdSize(cast_type.InternalType()) == 1) ? NumericLimits<uint8_t>::Maximum()
-			              : (GetTypeIdSize(cast_type.InternalType()) == 2) ? NumericLimits<uint16_t>::Maximum()
-			              : (GetTypeIdSize(cast_type.InternalType()) == 4) ? (uint64_t)NumericLimits<uint32_t>::Maximum()
-			                                                               : NumericLimits<uint64_t>::Maximum();
-			min = (max_u <= cast_max) ? Value(0).DefaultCastAs(type) : NumericStats::Min(stats);
-		} else {
-			min = NumericStats::Min(stats);
-		}
+		min = NumericStats::Min(stats);
 	} else {
 		// We don't have enough stats to do anything
 		return nullptr;
@@ -408,8 +398,10 @@ unique_ptr<CompressExpression> CompressedMaterialization::GetIntegralCompress(un
 	vector<unique_ptr<Expression>> arguments;
 	arguments.emplace_back(std::move(input));
 	arguments.emplace_back(make_uniq<BoundConstantExpression>(min));
-	auto compress_expr =
-	    make_uniq<BoundFunctionExpression>(cast_type, compress_function, std::move(arguments), nullptr);
+
+	BoundScalarFunction bound_function(compress_function);
+	bound_function.SetReturnType(cast_type);
+	auto compress_expr = make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(arguments), nullptr);
 
 	auto compress_stats = BaseStatistics::CreateEmpty(cast_type);
 	compress_stats.CopyBase(stats);
@@ -475,8 +467,11 @@ unique_ptr<CompressExpression> CompressedMaterialization::GetStringCompress(uniq
 	auto compress_function = CMStringCompressFun::GetFunction(cast_type);
 	vector<unique_ptr<Expression>> arguments;
 	arguments.emplace_back(std::move(input));
-	auto compress_expr =
-	    make_uniq<BoundFunctionExpression>(cast_type, compress_function, std::move(arguments), nullptr);
+
+	BoundScalarFunction bound_function(compress_function);
+	bound_function.SetReturnType(cast_type);
+
+	auto compress_expr = make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(arguments), nullptr);
 	return make_uniq<CompressExpression>(std::move(compress_expr), compress_stats.ToUnique());
 }
 
@@ -497,25 +492,30 @@ unique_ptr<Expression> CompressedMaterialization::GetIntegralDecompress(unique_p
                                                                         const LogicalType &result_type,
                                                                         const BaseStatistics &stats) {
 	D_ASSERT(!stats.CanHaveNoNull() || NumericStats::HasMinMax(stats));
-	auto decompress_function = CMIntegralDecompressFun::GetFunction(input->return_type, result_type);
+	auto decompress_function = CMIntegralDecompressFun::GetFunction(input->GetReturnType(), result_type);
 	const auto min = !stats.CanHaveNoNull() ? Value(result_type) : NumericStats::Min(stats);
-	const auto max = !stats.CanHaveNoNull() ? Value(result_type) : NumericStats::Max(stats);
-
 	vector<unique_ptr<Expression>> arguments;
 	arguments.emplace_back(std::move(input));
 	arguments.emplace_back(make_uniq<BoundConstantExpression>(min));
-	arguments.emplace_back(make_uniq<BoundConstantExpression>(max));
-	return make_uniq<BoundFunctionExpression>(result_type, decompress_function, std::move(arguments), nullptr);
+
+	BoundScalarFunction bound_function(decompress_function);
+	bound_function.SetReturnType(result_type);
+
+	return make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(arguments), nullptr);
 }
 
 unique_ptr<Expression> CompressedMaterialization::GetStringDecompress(unique_ptr<Expression> input,
                                                                       const LogicalType &result_type,
                                                                       const BaseStatistics &stats) {
 	D_ASSERT(!stats.CanHaveNoNull() || StringStats::HasMaxStringLength(stats));
-	auto decompress_function = CMStringDecompressFun::GetFunction(input->return_type);
+	auto decompress_function = CMStringDecompressFun::GetFunction(input->GetReturnType());
 	vector<unique_ptr<Expression>> arguments;
 	arguments.emplace_back(std::move(input));
-	return make_uniq<BoundFunctionExpression>(result_type, decompress_function, std::move(arguments), nullptr);
+
+	BoundScalarFunction bound_function(decompress_function);
+	bound_function.SetReturnType(result_type);
+
+	return make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(arguments), nullptr);
 }
 
 } // namespace duckdb

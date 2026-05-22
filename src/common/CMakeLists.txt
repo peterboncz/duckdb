@@ -34,6 +34,8 @@ add_library_unity(
   assert.cpp
   bind_helpers.cpp
   box_renderer.cpp
+  box_renderer_context.cpp
+  client_box_renderer_context.cpp
   column_data_collection_render_interface.cpp
   cgroups.cpp
   column_index.cpp
@@ -74,6 +76,7 @@ add_library_unity(
   tree_renderer.cpp
   types.cpp
   bignum.cpp
+  clustered_aggregate.cpp
   virtual_file_system.cpp
   windows_util.cpp)
 set(ALL_OBJECT_FILES

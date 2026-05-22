@@ -14,6 +14,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/compression/bitpacking.hpp"
+#include "duckdb/storage/compression/bitpacking_for_scan.hpp"
 #include "duckdb/storage/table/column_data_checkpointer.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -127,7 +128,7 @@ public:
 
 	void CalculateDeltaStats() {
 		// TODO: currently we dont support delta compression of values above NumericLimits<T_S>::Maximum(),
-		// 		 we could support this with some clever substract trickery?
+		// 		 we could support this with some clever subtract trickery?
 		if (maximum > static_cast<T>(NumericLimits<T_S>::Maximum())) {
 			return;
 		}
@@ -272,7 +273,8 @@ public:
 	}
 
 	template <class OP = EmptyBitpackingWriter>
-	bool Update(T value, bool is_valid) {
+	bool Update(typename VectorIterator<T>::ValueEntry val) {
+		auto is_valid = val.IsValid();
 		compression_buffer_validity[compression_buffer_idx] = is_valid;
 		has_valid = has_valid || is_valid;
 		has_invalid = has_invalid || !is_valid;
@@ -280,6 +282,7 @@ public:
 		all_invalid = all_invalid && !is_valid;
 
 		if (is_valid) {
+			auto value = val.GetValue();
 			compression_buffer[compression_buffer_idx] = value;
 			minimum = MinValue<T>(minimum, value);
 			maximum = MaxValue<T>(maximum, value);
@@ -325,8 +328,8 @@ bool BitpackingAnalyze(AnalyzeState &state, Vector &input, idx_t count) {
 	}
 
 	auto &analyze_state = state.Cast<BitpackingAnalyzeState<T>>();
-	for (auto entry : input.Values<T>(count)) {
-		if (!analyze_state.state.template Update<EmptyBitpackingWriter>(entry.value, entry.is_valid)) {
+	for (auto entry : input.Values<T>()) {
+		if (!analyze_state.state.template Update<EmptyBitpackingWriter>(entry)) {
 			return false;
 		}
 	}
@@ -435,7 +438,7 @@ public:
 		}
 
 		static void WriteMetaData(BitpackingCompressionState<T, WRITE_STATISTICS> *state, BitpackingMode mode) {
-			bitpacking_metadata_t metadata {mode, (uint32_t)(state->data_ptr - state->handle.Ptr())};
+			bitpacking_metadata_t metadata {mode, (uint32_t)(state->data_ptr - state->handle.GetDataMutable())};
 			state->metadata_ptr -= sizeof(bitpacking_metadata_encoded_t);
 			Store<bitpacking_metadata_encoded_t>(EncodeMeta(metadata), state->metadata_ptr);
 		}
@@ -484,17 +487,13 @@ public:
 		auto &buffer_manager = BufferManager::GetBufferManager(db);
 		handle = buffer_manager.Pin(current_segment->block);
 
-		data_ptr = handle.Ptr() + BitpackingPrimitives::BITPACKING_HEADER_SIZE;
-		metadata_ptr = handle.Ptr() + info.GetBlockSize();
+		data_ptr = handle.GetDataMutable() + BitpackingPrimitives::BITPACKING_HEADER_SIZE;
+		metadata_ptr = handle.GetDataMutable() + info.GetBlockSize();
 	}
 
-	void Append(UnifiedVectorFormat &vdata, idx_t count) {
-		auto data = UnifiedVectorFormat::GetData<T>(vdata);
-
-		for (idx_t i = 0; i < count; i++) {
-			idx_t idx = vdata.sel->get_index(i);
-			state.template Update<BitpackingCompressionState<T, WRITE_STATISTICS, T_S>::BitpackingWriter>(
-			    data[idx], vdata.validity.RowIsValid(idx));
+	void Append(Vector &input, idx_t count) {
+		for (auto entry : input.Values<T>()) {
+			state.template Update<BitpackingWriter>(entry);
 		}
 	}
 
@@ -507,7 +506,7 @@ public:
 
 	void FlushSegment() {
 		auto &state = checkpoint_data.GetCheckpointState();
-		auto base_ptr = handle.Ptr();
+		auto base_ptr = handle.GetDataMutable();
 
 		// Compact the segment by moving the metadata next to the data.
 
@@ -549,9 +548,7 @@ unique_ptr<CompressionState> BitpackingInitCompression(ColumnDataCheckpointData 
 template <class T, bool WRITE_STATISTICS>
 void BitpackingCompress(CompressionState &state_p, Vector &scan_vector, idx_t count) {
 	auto &state = state_p.Cast<BitpackingCompressionState<T, WRITE_STATISTICS>>();
-	UnifiedVectorFormat vdata;
-	scan_vector.ToUnifiedFormat(count, vdata);
-	state.Append(vdata, count);
+	state.Append(scan_vector, count);
 }
 
 template <class T, bool WRITE_STATISTICS>
@@ -563,18 +560,6 @@ void BitpackingFinalizeCompress(CompressionState &state_p) {
 //===--------------------------------------------------------------------===//
 // Scan
 //===--------------------------------------------------------------------===//
-template <class T>
-static void ApplyFrameOfReference(T *dst, T frame_of_reference, idx_t size) {
-	using T_U = typename MakeUnsigned<T>::type;
-	if (!frame_of_reference) {
-		return;
-	}
-
-	for (idx_t i = 0; i < size; i++) {
-		reinterpret_cast<T_U *>(dst)[i] += static_cast<T_U>(frame_of_reference);
-	}
-}
-
 // Based on https://github.com/lemire/FastPFor (Apache License 2.0)
 template <class T>
 static T DeltaDecode(T *data, T previous_value, const size_t size) {
@@ -601,19 +586,19 @@ static T DeltaDecode(T *data, T previous_value, const size_t size) {
 	return data[size - 1];
 }
 
-template <class T, class T_S = typename MakeSigned<T>::type>
+template <class T, class T_S>
 struct BitpackingScanState : public SegmentScanState {
 public:
 	explicit BitpackingScanState(const QueryContext &context, ColumnSegment &segment) : current_segment(segment) {
 		auto &buffer_manager = BufferManager::GetBufferManager(segment.db);
 		handle = buffer_manager.Pin(context, segment.block);
-		auto data_ptr = handle.Ptr();
+		auto data_ptr = handle.GetDataMutable();
 
 		// load offset to bitpacking widths pointer
 		auto bitpacking_metadata_offset = Load<idx_t>(data_ptr + segment.GetBlockOffset());
 		bitpacking_metadata_ptr =
 		    data_ptr + segment.GetBlockOffset() + bitpacking_metadata_offset - sizeof(bitpacking_metadata_encoded_t);
-		if (bitpacking_metadata_ptr >= handle.Ptr() + current_segment.GetBlockSize()) {
+		if (bitpacking_metadata_ptr >= handle.GetDataMutable() + current_segment.GetBlockSize()) {
 			throw InternalException("Bitpacking offset is out of range at block \"%llu\" - corrupt database file",
 			                        segment.block->BlockId());
 		}
@@ -642,8 +627,8 @@ public:
 	//! It also loads any metadata at the start of a compressed buffer (e.g. the width, for, or constant value)
 	//! depending on the bitpacking mode of that group.
 	void LoadNextGroup() {
-		D_ASSERT(bitpacking_metadata_ptr > handle.Ptr() &&
-		         (bitpacking_metadata_ptr < handle.Ptr() + current_segment.GetBlockSize()));
+		D_ASSERT(bitpacking_metadata_ptr > handle.GetDataMutable() &&
+		         (bitpacking_metadata_ptr < handle.GetDataMutable() + current_segment.GetBlockSize()));
 		current_group_offset = 0;
 		current_group = DecodeMeta(reinterpret_cast<bitpacking_metadata_encoded_t *>(bitpacking_metadata_ptr));
 
@@ -755,7 +740,7 @@ public:
 	}
 
 	data_ptr_t GetPtr(bitpacking_metadata_t group) {
-		return handle.Ptr() + current_segment.GetBlockOffset() + group.offset;
+		return handle.GetDataMutable() + current_segment.GetBlockOffset() + group.offset;
 	}
 };
 
@@ -784,140 +769,9 @@ static void DecodeFORBlock(BitpackingScanState<T> &scan_state, idx_t group_offse
 		                                     skip_sign_extend);
 		memcpy(result_ptr, scan_state.decompression_buffer + offset_in_compression_group, to_scan * sizeof(T));
 	}
-
 	if (apply_frame) {
 		ApplyFrameOfReference<T>(result_ptr, scan_state.current_frame_of_reference, to_scan);
 	}
-}
-
-//===--------------------------------------------------------------------===//
-// Scan base data
-//===--------------------------------------------------------------------===//
-template <class T>
-static PhysicalType FORGroupType(T, bitpacking_width_t width) {
-	PhysicalType stored_type;
-	return FORVector::TryGetStoredTypeForRangeBits(width, stored_type) ? stored_type : PhysicalType::INVALID;
-}
-
-//! Widen narrow data in buf from old_type to new_type (backwards to handle overlap).
-static void WidenFORData(data_ptr_t buf, idx_t count, PhysicalType old_type, PhysicalType new_type) {
-	FOR_SWITCH_STORED(old_type, OLD, {
-		FOR_SWITCH_STORED(new_type, NEW, {
-			auto src = reinterpret_cast<const OLD *>(buf);
-			auto dst = reinterpret_cast<NEW *>(buf);
-			for (idx_t j = count; j-- > 0;) {
-				dst[j] = static_cast<NEW>(src[j]);
-			}
-		});
-	});
-}
-
-//! Widen narrow FOR data back to full-width T (for aborting FOR mode).
-template <class T>
-static void FORToFlat(data_ptr_t buf, idx_t count, PhysicalType stored_type, T min_value) {
-	auto dst = reinterpret_cast<T *>(buf);
-	FOR_SWITCH_STORED(stored_type, S, {
-		auto src = reinterpret_cast<const S *>(buf);
-		for (idx_t j = count; j-- > 0;) {
-			dst[j] = FORVector::AddDelta<T>(min_value, src[j]);
-		}
-	});
-}
-
-static inline PhysicalType StoredTypeForWidth(bitpacking_width_t width) {
-	PhysicalType stored_type;
-	auto success = FORVector::TryGetStoredTypeForRangeBits(width, stored_type);
-	D_ASSERT(success);
-	return stored_type;
-}
-
-//! Decode N full consecutive FOR algorithm groups of the same width.
-//! `count` must be a multiple of BITPACKING_ALGORITHM_GROUP_SIZE; group_offset
-//! must be 32-aligned. Uses a single switch(width) dispatch via UnPackBuffer,
-//! so every unpacked value sees `width` as a compile-time constant across
-//! the whole batch — enables cross-group auto-vectorisation.
-template <class T>
-static PhysicalType DecodeFORGroupsBatch(BitpackingScanState<T> &scan_state, idx_t group_offset,
-                                         idx_t count,
-                                         data_ptr_t result_buf, idx_t narrow_offset) {
-	D_ASSERT(count % BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE == 0);
-	D_ASSERT(group_offset % BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE == 0);
-	auto width = scan_state.current_width;
-	data_ptr_t src = scan_state.current_group_ptr + group_offset * width / 8;
-
-	PhysicalType st = StoredTypeForWidth(width);
-	idx_t elem_size = GetTypeIdSize(st);
-
-	data_ptr_t dst = result_buf + narrow_offset * elem_size;
-	switch (st) {
-	case PhysicalType::UINT8:
-		BitpackingPrimitives::UnPackBuffer<uint8_t>(dst, src, count, width, true);
-		break;
-	case PhysicalType::UINT16:
-		BitpackingPrimitives::UnPackBuffer<uint16_t>(dst, src, count, width, true);
-		break;
-	case PhysicalType::UINT32:
-		BitpackingPrimitives::UnPackBuffer<uint32_t>(dst, src, count, width, true);
-		break;
-	default:
-		BitpackingPrimitives::UnPackBuffer<uint64_t>(dst, src, count, width, true);
-		break;
-	}
-	return st;
-}
-
-//! Decode a FOR bitpacking group. Unpacks to the nearest-fit type determined
-//! by width, applies FOR, handles partial groups. Returns the stored PhysicalType.
-//! Uses BitpackingPrimitives::UnPackBlock which routes to the width-optimized
-//! fastpforlib fastunpack for uint8/uint16/uint32 targets (NEON on ARM).
-template <class T>
-static PhysicalType DecodeFORGroupDirect(BitpackingScanState<T> &scan_state, idx_t group_offset,
-                                         idx_t offset_in_group, idx_t count,
-                                         data_ptr_t result_buf, idx_t narrow_offset) {
-	constexpr idx_t GROUP = BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE;
-	data_ptr_t pos = scan_state.current_group_ptr + group_offset * scan_state.current_width / 8;
-	data_ptr_t src = pos - offset_in_group * scan_state.current_width / 8;
-	auto width = scan_state.current_width;
-
-	PhysicalType st = StoredTypeForWidth(width);
-	idx_t elem_size = GetTypeIdSize(st);
-
-	data_ptr_t dst = result_buf + narrow_offset * elem_size;
-	auto do_unpack = [&](data_ptr_t out) {
-		switch (st) {
-		case PhysicalType::UINT8:
-			BitpackingPrimitives::UnPackBlock<uint8_t>(out, src, width, true);
-			break;
-		case PhysicalType::UINT16:
-			BitpackingPrimitives::UnPackBlock<uint16_t>(out, src, width, true);
-			break;
-		case PhysicalType::UINT32:
-			BitpackingPrimitives::UnPackBlock<uint32_t>(out, src, width, true);
-			break;
-		default:
-			BitpackingPrimitives::UnPackBlock<uint64_t>(out, src, width, true);
-			break;
-		}
-	};
-	if (count == GROUP && offset_in_group == 0) {
-		do_unpack(dst);
-	} else {
-		uint8_t temp[GROUP * sizeof(uint64_t)];
-		do_unpack(temp);
-		memcpy(dst, temp + offset_in_group * elem_size, count * elem_size);
-	}
-	return st;
-}
-
-//! Abort FOR mode: widen existing narrow data back to T, mark FOR as inactive.
-template <class T>
-static void AbortFOR(data_ptr_t result_buf, idx_t scanned, PhysicalType &for_st, T &for_min, bool &try_for) {
-	if (for_st != PhysicalType::INVALID) {
-		FORToFlat<T>(result_buf, scanned, for_st, for_min);
-	}
-	for_st = PhysicalType::INVALID;
-	for_min = T(0);
-	try_for = false;
 }
 
 template <class T, class T_S = typename MakeSigned<T>::type, class T_U = typename MakeUnsigned<T>::type>
@@ -925,21 +779,21 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
                            idx_t result_offset) {
 	auto &scan_state = state.scan_state->Cast<BitpackingScanState<T>>();
 
-	auto result_buf = result.GetBuffer()->GetData();
+	auto result_buf = result.BufferMutable().GetData();
 	T *result_data = reinterpret_cast<T *>(result_buf);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 
-	// FOR tracking: try to produce narrow FOR output when possible
 	bool try_for = sizeof(T) > 1 && result_offset == 0;
 	if (try_for) {
 		auto client = state.context.GetClientContext();
-		if (client && !ClientConfig::GetConfig(*client).for_vectors) try_for = false;
+		if (client && !ClientConfig::GetConfig(*client).for_vectors) {
+			try_for = false;
+		}
 	}
 	PhysicalType for_st = PhysicalType::INVALID; // INVALID = not in FOR mode
-	T for_min = 0;
-	uint8_t for_range_bits = 0;
-
+	T for_max = 0;
 	idx_t scanned = 0;
+
 	while (scanned < scan_count) {
 		D_ASSERT(scan_state.current_group_offset <= BITPACKING_METADATA_GROUP_SIZE);
 		if (scan_state.current_group_offset == BITPACKING_METADATA_GROUP_SIZE) {
@@ -952,7 +806,16 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 			idx_t remaining = scan_count - scanned;
 			idx_t to_scan = MinValue(remaining, BITPACKING_METADATA_GROUP_SIZE - scan_state.current_group_offset);
 			if (try_for) {
-				AbortFOR<T>(result_buf, scanned, for_st, for_min, try_for);
+				PhysicalType requested_type;
+				if (TryFORStoredTypeForMax<T>(scan_state.current_constant, requested_type)) {
+					ReconcileFORType(result_buf, scanned, requested_type, for_st);
+					for_max = MaxValue(for_max, scan_state.current_constant);
+					FillFORConstant<T>(result_buf, scanned, to_scan, for_st, scan_state.current_constant);
+					scanned += to_scan;
+					scan_state.current_group_offset += to_scan;
+					continue;
+				}
+				AbortFOR<T>(result_buf, scanned, for_st, try_for);
 			}
 			T *begin = result_data + result_offset + scanned;
 			std::fill(begin, begin + to_scan, scan_state.current_constant);
@@ -964,7 +827,48 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 			idx_t remaining = scan_count - scanned;
 			idx_t to_scan = MinValue(remaining, BITPACKING_METADATA_GROUP_SIZE - scan_state.current_group_offset);
 			if (try_for) {
-				AbortFOR<T>(result_buf, scanned, for_st, for_min, try_for);
+				bool can_for = true;
+				T group_max = 0;
+				for (idx_t i = 0; i < to_scan; i++) {
+					T multiplier;
+					if (!TryCast::Operation<idx_t, T>(scan_state.current_group_offset + i, multiplier)) {
+						can_for = false;
+						break;
+					}
+					T product;
+					T value;
+					if (!TryMultiplyOperator::Operation(multiplier, scan_state.current_constant, product) ||
+					    !TryAddOperator::Operation(product, scan_state.current_frame_of_reference, value) ||
+					    (NumericLimits<T>::IsSigned() && value < T(0))) {
+						can_for = false;
+						break;
+					}
+					group_max = i == 0 ? value : MaxValue(group_max, value);
+				}
+				PhysicalType requested_type;
+				if (can_for && TryFORStoredTypeForMax<T>(group_max, requested_type)) {
+					ReconcileFORType(result_buf, scanned, requested_type, for_st);
+					for_max = MaxValue(for_max, group_max);
+					FOR_SWITCH_STORED(for_st, ST, {
+						auto target = reinterpret_cast<ST *>(result_buf + scanned * GetTypeIdSize(for_st));
+						for (idx_t i = 0; i < to_scan; i++) {
+							T multiplier;
+							auto cast = TryCast::Operation<idx_t, T>(scan_state.current_group_offset + i, multiplier);
+							D_ASSERT(cast);
+							T product;
+							T value;
+							auto multiply = TryMultiplyOperator::Operation(multiplier, scan_state.current_constant,
+							                                                product);
+							auto add = TryAddOperator::Operation(product, scan_state.current_frame_of_reference, value);
+							D_ASSERT(multiply && add);
+							target[i] = UnsafeNumericCast<ST>(value);
+						}
+					});
+					scanned += to_scan;
+					scan_state.current_group_offset += to_scan;
+					continue;
+				}
+				AbortFOR<T>(result_buf, scanned, for_st, try_for);
 			}
 			T *target_ptr = result_data + result_offset + scanned;
 			for (idx_t i = 0; i < to_scan; i++) {
@@ -983,64 +887,58 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 		                                                          offset_in_compression_group);
 
 		if (scan_state.current_group.mode == BitpackingMode::DELTA_FOR || !try_for) {
-			// DELTA_FOR or already flat: decode as full-width T
-			AbortFOR<T>(result_buf, scanned, for_st, for_min, try_for);
+			AbortFOR<T>(result_buf, scanned, for_st, try_for);
 			T *current_result_ptr = result_data + result_offset + scanned;
 			if (scan_state.current_group.mode == BitpackingMode::DELTA_FOR) {
 				DecodeFORBlock(scan_state, scan_state.current_group_offset, offset_in_compression_group, to_scan,
-				               current_result_ptr, false);
-				ApplyFrameOfReference<T_S>(reinterpret_cast<T_S *>(current_result_ptr),
-				                           static_cast<T_S>(scan_state.current_frame_of_reference), to_scan);
+				               current_result_ptr, true);
 				DeltaDecode<T_S>(reinterpret_cast<T_S *>(current_result_ptr),
 				                 static_cast<T_S>(scan_state.current_delta_offset), to_scan);
 				scan_state.current_delta_offset = current_result_ptr[to_scan - 1];
 			} else {
+				idx_t remaining = MinValue<idx_t>(scan_count - scanned,
+				                                  BITPACKING_METADATA_GROUP_SIZE - scan_state.current_group_offset);
+				idx_t batch_count = offset_in_compression_group == 0
+				                        ? remaining & ~(BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE - 1)
+				                        : 0;
+				if (batch_count > 0) {
+					DecodeFORBlocksBatchFlat(scan_state, scan_state.current_group_offset, batch_count,
+					                         current_result_ptr);
+					scanned += batch_count;
+					scan_state.current_group_offset += batch_count;
+					continue;
+				}
 				DecodeFORBlock(scan_state, scan_state.current_group_offset, offset_in_compression_group, to_scan,
 				               current_result_ptr, true);
 			}
 		} else {
-			PhysicalType check_st = FORGroupType<T>(scan_state.current_frame_of_reference, scan_state.current_width);
-			auto group_min = scan_state.current_frame_of_reference;
-			if (check_st == PhysicalType::INVALID || group_min != T(0)) {
-				AbortFOR<T>(result_buf, scanned, for_st, for_min, try_for);
+			PhysicalType requested_type;
+			T group_max;
+			if (!TryFORGroupType<T>(scan_state.current_frame_of_reference, scan_state.current_width, requested_type,
+			                        group_max)) {
+				AbortFOR<T>(result_buf, scanned, for_st, try_for);
 				DecodeFORBlock(scan_state, scan_state.current_group_offset, offset_in_compression_group, to_scan,
 				               result_data + result_offset + scanned, true);
 			} else {
-				auto group_range_bits = NumericCast<uint8_t>(scan_state.current_width);
-				if (for_st != PhysicalType::INVALID &&
-				    (for_st != check_st || for_min != group_min || for_range_bits != group_range_bits)) {
-					AbortFOR<T>(result_buf, scanned, for_st, for_min, try_for);
-					DecodeFORBlock(scan_state, scan_state.current_group_offset, offset_in_compression_group, to_scan,
-					               result_data + result_offset + scanned, true);
-					scanned += to_scan;
-					scan_state.current_group_offset += to_scan;
-					continue;
-				}
-				for_st = check_st;
-				for_min = group_min;
-				for_range_bits = group_range_bits;
+				ReconcileFORType(result_buf, scanned, requested_type, for_st);
+				for_max = MaxValue(for_max, group_max);
 				DecodeFORGroupDirect(scan_state, scan_state.current_group_offset, offset_in_compression_group, to_scan,
-				                    result_buf, scanned);
+				                     result_buf, scanned, for_st);
 				scanned += to_scan;
 				scan_state.current_group_offset += to_scan;
-				// Remaining algorithm groups in this metadata group — same width.
-				// Batch as many full 32-value groups as possible into ONE call:
-				// a single switch(width) in UnPackBuffer → compiler sees width as
-				// compile-time constant across all groups and vectorises across them.
 				idx_t remaining = MinValue<idx_t>(scan_count - scanned,
-				                                  BITPACKING_METADATA_GROUP_SIZE -
-				                                      scan_state.current_group_offset);
-				idx_t batch_count =
-				    remaining & ~(BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE - 1);
+				                                  BITPACKING_METADATA_GROUP_SIZE - scan_state.current_group_offset);
+				idx_t batch_count = remaining & ~(BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE - 1);
 				if (batch_count > 0) {
-					DecodeFORGroupsBatch(scan_state, scan_state.current_group_offset, batch_count, result_buf, scanned);
+					DecodeFORGroupsBatch(scan_state, scan_state.current_group_offset, batch_count, result_buf, scanned,
+					                     for_st);
 					scanned += batch_count;
 					scan_state.current_group_offset += batch_count;
 				}
-				// Partial last group (fewer than 32 values requested)
 				idx_t tail = remaining - batch_count;
 				if (tail > 0) {
-					DecodeFORGroupDirect(scan_state, scan_state.current_group_offset, 0, tail, result_buf, scanned);
+					DecodeFORGroupDirect(scan_state, scan_state.current_group_offset, 0, tail, result_buf, scanned,
+					                     for_st);
 					scanned += tail;
 					scan_state.current_group_offset += tail;
 				}
@@ -1054,7 +952,7 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 
 	if (sizeof(T) > 1) {
 		if (for_st != PhysicalType::INVALID) {
-			FORVector::Create<T>(result, for_st, for_min, for_range_bits);
+			FORVector::Create<T>(result, for_st, for_max);
 		}
 	}
 }

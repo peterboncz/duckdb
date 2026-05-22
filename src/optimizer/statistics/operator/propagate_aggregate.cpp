@@ -11,6 +11,7 @@
 #include "duckdb/function/partition_stats.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/optimizer/statistics_propagator.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -91,13 +92,25 @@ bool TryGetValueFromStats(const PartitionStatistics &stats, const StorageIndex &
 		}
 	} else {
 		D_ASSERT(column_stats->GetStatsType() == StatisticsType::STRING_STATS);
-		if (StringStats::Min(*column_stats) > StringStats::Max(*column_stats)) {
-			// No min/max statistics availabe
+		if (!StringStats::HasMinMax(*column_stats)) {
 			return false;
 		}
 	}
 	result = comparator.GetVal(*column_stats);
 	return true;
+}
+
+bool GroupingSetCanIntroduceNull(const LogicalAggregate &aggr, idx_t group_idx) {
+	if (aggr.grouping_sets.empty()) {
+		return false;
+	}
+	const auto projection_idx = ProjectionIndex(group_idx);
+	for (const auto &grouping_set : aggr.grouping_sets) {
+		if (grouping_set.find(projection_idx) == grouping_set.end()) {
+			return true;
+		}
+	}
+	return false;
 }
 
 } // namespace
@@ -123,14 +136,15 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			// aggregate has a filter - bail
 			return;
 		}
-		const string &fun_name = aggr_expr.function.name;
+		const string &fun_name = aggr_expr.function.GetName();
 		if (fun_name == "min" || fun_name == "max") {
-			if (aggr_expr.children.size() != 1 || aggr_expr.children[0]->type != ExpressionType::BOUND_COLUMN_REF) {
+			if (aggr_expr.children.size() != 1 ||
+			    aggr_expr.children[0]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 				return;
 			}
 			const auto &col_ref = aggr_expr.children[0]->Cast<BoundColumnRefExpression>();
 			min_max_bindings.push_back(col_ref.binding);
-			auto comparator = GetComparator(fun_name, col_ref.return_type);
+			auto comparator = GetComparator(fun_name, col_ref.GetReturnType());
 			if (!comparator) {
 				// Type has no min max statistics
 				return;
@@ -150,7 +164,7 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		for (auto &binding : min_max_bindings) {
 			auto &proj = child_ref.get().Cast<LogicalProjection>();
 			auto &expr = proj.GetExpression(binding);
-			if (expr.type != ExpressionType::BOUND_COLUMN_REF) {
+			if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 				return;
 			}
 			binding = expr.Cast<BoundColumnRefExpression>().binding;
@@ -223,7 +237,9 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 				if (!column_stats) {
 					return;
 				}
-				auto col_filter_result = filter.get().CheckStatistics(*column_stats);
+				auto &expr_filter =
+				    ExpressionFilter::GetExpressionFilter(filter.get(), "AggregateStats::CheckPartitionFilters");
+				auto col_filter_result = expr_filter.CheckStatistics(*column_stats);
 				if (col_filter_result == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
 					// all data in this partition is filtered out, remove this partition entirely
 					filter_result = FilterPropagateResult::FILTER_ALWAYS_FALSE;
@@ -311,14 +327,11 @@ unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalAggr
 	aggr.group_stats.resize(aggr.groups.size());
 	for (idx_t group_idx = 0; group_idx < aggr.groups.size(); group_idx++) {
 		auto stats = PropagateExpression(aggr.groups[group_idx]);
+		if (stats && GroupingSetCanIntroduceNull(aggr, group_idx)) {
+			stats->Set(StatsInfo::CAN_HAVE_NULL_VALUES);
+		}
 		aggr.group_stats[group_idx] = stats ? stats->ToUnique() : nullptr;
 		if (!stats) {
-			continue;
-		}
-		if (aggr.grouping_sets.size() > 1) {
-			// aggregates with multiple grouping sets can introduce NULL values to certain groups
-			// FIXME: actually figure out WHICH groups can have null values introduced
-			stats->Set(StatsInfo::CAN_HAVE_NULL_VALUES);
 			continue;
 		}
 		ColumnBinding group_binding(aggr.group_index, ProjectionIndex(group_idx));
