@@ -307,54 +307,42 @@ static idx_t TemplatedFilterSelection(const UnifiedVectorFormat &vdata, T predic
 	return result_count;
 }
 
+template <class T, class OP>
+static inline idx_t FilterSelectionOperation(const UnifiedVectorFormat &vdata, T predicate, const SelectionVector &sel,
+                                             idx_t count, SelectionVector &result_sel) {
+	return vdata.validity.CannotHaveNull() ? TemplatedFilterSelection<T, OP, false>(vdata, predicate, sel, count,
+	                                                                                result_sel)
+	                                      : TemplatedFilterSelection<T, OP, true>(vdata, predicate, sel, count,
+	                                                                               result_sel);
+}
+
 template <class T>
 static void FilterSelectionSwitch(UnifiedVectorFormat &vdata, T predicate, SelectionVector &sel,
                                   idx_t &approved_tuple_count, ExpressionType comparison_type) {
 	SelectionVector new_sel(approved_tuple_count);
-	auto &mask = vdata.validity;
 	switch (comparison_type) {
 	case ExpressionType::COMPARE_EQUAL:
-		approved_tuple_count = mask.CannotHaveNull()
-		                           ? TemplatedFilterSelection<T, Equals, false>(vdata, predicate, sel,
-		                                                                        approved_tuple_count, new_sel)
-		                           : TemplatedFilterSelection<T, Equals, true>(vdata, predicate, sel,
-		                                                                       approved_tuple_count, new_sel);
+		approved_tuple_count = FilterSelectionOperation<T, Equals>(vdata, predicate, sel, approved_tuple_count, new_sel);
 		break;
 	case ExpressionType::COMPARE_NOTEQUAL:
-		approved_tuple_count = mask.CannotHaveNull()
-		                           ? TemplatedFilterSelection<T, NotEquals, false>(vdata, predicate, sel,
-		                                                                           approved_tuple_count, new_sel)
-		                           : TemplatedFilterSelection<T, NotEquals, true>(vdata, predicate, sel,
-		                                                                          approved_tuple_count, new_sel);
+		approved_tuple_count =
+		    FilterSelectionOperation<T, NotEquals>(vdata, predicate, sel, approved_tuple_count, new_sel);
 		break;
 	case ExpressionType::COMPARE_LESSTHAN:
-		approved_tuple_count = mask.CannotHaveNull()
-		                           ? TemplatedFilterSelection<T, LessThan, false>(vdata, predicate, sel,
-		                                                                          approved_tuple_count, new_sel)
-		                           : TemplatedFilterSelection<T, LessThan, true>(vdata, predicate, sel,
-		                                                                         approved_tuple_count, new_sel);
+		approved_tuple_count =
+		    FilterSelectionOperation<T, LessThan>(vdata, predicate, sel, approved_tuple_count, new_sel);
 		break;
 	case ExpressionType::COMPARE_GREATERTHAN:
-		approved_tuple_count = mask.CannotHaveNull()
-		                           ? TemplatedFilterSelection<T, GreaterThan, false>(vdata, predicate, sel,
-		                                                                             approved_tuple_count, new_sel)
-		                           : TemplatedFilterSelection<T, GreaterThan, true>(vdata, predicate, sel,
-		                                                                            approved_tuple_count, new_sel);
+		approved_tuple_count =
+		    FilterSelectionOperation<T, GreaterThan>(vdata, predicate, sel, approved_tuple_count, new_sel);
 		break;
 	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		approved_tuple_count = mask.CannotHaveNull()
-		                           ? TemplatedFilterSelection<T, LessThanEquals, false>(vdata, predicate, sel,
-		                                                                                 approved_tuple_count, new_sel)
-		                           : TemplatedFilterSelection<T, LessThanEquals, true>(vdata, predicate, sel,
-		                                                                                approved_tuple_count, new_sel);
+		approved_tuple_count =
+		    FilterSelectionOperation<T, LessThanEquals>(vdata, predicate, sel, approved_tuple_count, new_sel);
 		break;
 	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
 		approved_tuple_count =
-		    mask.CannotHaveNull()
-		        ? TemplatedFilterSelection<T, GreaterThanEquals, false>(vdata, predicate, sel, approved_tuple_count,
-		                                                                new_sel)
-		        : TemplatedFilterSelection<T, GreaterThanEquals, true>(vdata, predicate, sel, approved_tuple_count,
-		                                                               new_sel);
+		    FilterSelectionOperation<T, GreaterThanEquals>(vdata, predicate, sel, approved_tuple_count, new_sel);
 		break;
 	default:
 		throw NotImplementedException("Unknown comparison type for filter pushed down to table!");
@@ -429,51 +417,26 @@ static inline bool TryFastConstantComparisonSelection(UnifiedVectorFormat &vdata
 		return false;
 	}
 
+#define FILTER_SELECTION_TYPE(PT, T)                                                                                   \
+	case PhysicalType::PT:                                                                                             \
+		FilterSelectionSwitch<T>(vdata, constant.GetValueUnsafe<T>(), sel, approved_tuple_count, comparison_type);     \
+		return true
 	switch (type.InternalType()) {
 	case PhysicalType::BOOL:
-	case PhysicalType::INT8:
-		FilterSelectionSwitch<int8_t>(vdata, constant.GetValueUnsafe<int8_t>(), sel, approved_tuple_count,
-		                               comparison_type);
-		return true;
-	case PhysicalType::INT16:
-		FilterSelectionSwitch<int16_t>(vdata, constant.GetValueUnsafe<int16_t>(), sel, approved_tuple_count,
-		                                comparison_type);
-		return true;
-	case PhysicalType::INT32:
-		FilterSelectionSwitch<int32_t>(vdata, constant.GetValueUnsafe<int32_t>(), sel, approved_tuple_count,
-		                                comparison_type);
-		return true;
-	case PhysicalType::INT64:
-		FilterSelectionSwitch<int64_t>(vdata, constant.GetValueUnsafe<int64_t>(), sel, approved_tuple_count,
-		                                comparison_type);
-		return true;
-	case PhysicalType::UINT8:
-		FilterSelectionSwitch<uint8_t>(vdata, constant.GetValueUnsafe<uint8_t>(), sel, approved_tuple_count,
-		                                comparison_type);
-		return true;
-	case PhysicalType::UINT16:
-		FilterSelectionSwitch<uint16_t>(vdata, constant.GetValueUnsafe<uint16_t>(), sel, approved_tuple_count,
-		                                 comparison_type);
-		return true;
-	case PhysicalType::UINT32:
-		FilterSelectionSwitch<uint32_t>(vdata, constant.GetValueUnsafe<uint32_t>(), sel, approved_tuple_count,
-		                                 comparison_type);
-		return true;
-	case PhysicalType::UINT64:
-		FilterSelectionSwitch<uint64_t>(vdata, constant.GetValueUnsafe<uint64_t>(), sel, approved_tuple_count,
-		                                 comparison_type);
-		return true;
-	case PhysicalType::FLOAT:
-		FilterSelectionSwitch<float>(vdata, constant.GetValueUnsafe<float>(), sel, approved_tuple_count,
-		                              comparison_type);
-		return true;
-	case PhysicalType::DOUBLE:
-		FilterSelectionSwitch<double>(vdata, constant.GetValueUnsafe<double>(), sel, approved_tuple_count,
-		                               comparison_type);
-		return true;
+		FILTER_SELECTION_TYPE(INT8, int8_t);
+		FILTER_SELECTION_TYPE(INT16, int16_t);
+		FILTER_SELECTION_TYPE(INT32, int32_t);
+		FILTER_SELECTION_TYPE(INT64, int64_t);
+		FILTER_SELECTION_TYPE(UINT8, uint8_t);
+		FILTER_SELECTION_TYPE(UINT16, uint16_t);
+		FILTER_SELECTION_TYPE(UINT32, uint32_t);
+		FILTER_SELECTION_TYPE(UINT64, uint64_t);
+		FILTER_SELECTION_TYPE(FLOAT, float);
+		FILTER_SELECTION_TYPE(DOUBLE, double);
 	default:
 		return false;
 	}
+#undef FILTER_SELECTION_TYPE
 }
 
 static inline idx_t ExecuteExpressionFilterSelection(SelectionVector &sel, Vector &vector, ExpressionFilterState &state,

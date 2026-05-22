@@ -62,7 +62,7 @@ idx_t RowIdColumnData::ScanCount(ColumnScanState &state, Vector &result, idx_t c
 
 void RowIdColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
                              SelectionVector &sel, idx_t &count, const TableFilter &filter,
-                             TableFilterState &filter_state) {
+                             TableFilterState &filter_state, bool allow_bitmap) {
 	auto row_start = GetRowStart(state);
 	auto current_row = row_start + state.offset_in_column;
 	auto max_count = GetVectorCount(vector_index);

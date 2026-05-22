@@ -468,10 +468,12 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 
 	// Pre-convert empty target vectors to FOR when source has FOR (for compaction preservation)
 	auto prepare_for_append = [](DataChunk &target, const DataChunk &source) {
-		if (target.size() != 0) return;
+		if (target.size() != 0)
+			return;
 		for (idx_t ci = 0; ci < source.ColumnCount(); ci++) {
-			if (source.data[ci].GetVectorType() != VectorType::FOR_VECTOR) continue;
-			target.data[ci].SetVectorType(VectorType::FOR_VECTOR);
+			if (source.data[ci].GetVectorType() != VectorType::FOR_VECTOR)
+				continue;
+			target.data[ci].BufferMutable().SetVectorTypeOnly(VectorType::FOR_VECTOR);
 			auto st = FORVector::GetStoredType(source.data[ci]);
 			FOR_SWITCH_LOGICAL(source.data[ci].GetType().InternalType(), T, {
 				FORVector::SetMetadata<T>(target.data[ci], st, FORVector::GetMax<T>(source.data[ci]));
@@ -500,10 +502,13 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 		state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());
 		break;
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED_THEN_CHUNK_VIA_CONTINUATION: {
+		// Swap chunk and *state.cached_chunk
 		auto tmp = make_uniq<DataChunk>();
 		tmp->Move(chunk);
 		chunk.Move(*state.cached_chunk);
 		state.cached_chunk->Initialize(Allocator::Get(context.client), chunk.GetTypes());
+		// Now chunk holds what was in (*state.cached_chunk), and it's returned directly
+		// While what was in chunk will be returned at next iteration via continuation
 		state.cached_chunk->Move(*tmp);
 		state.must_return_continuation_chunk = true;
 		state.cached_result = child_result;

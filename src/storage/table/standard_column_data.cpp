@@ -75,7 +75,7 @@ idx_t StandardColumnData::ScanCount(ColumnScanState &state, Vector &result, idx_
 
 void StandardColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
                                 SelectionVector &sel, idx_t &count, const TableFilter &filter,
-                                TableFilterState &filter_state) {
+                                TableFilterState &filter_state, bool allow_bitmap) {
 	// check if we can do a specialized select
 	// the compression functions need to support this
 	auto compression = GetCompressionFunction();
@@ -88,7 +88,7 @@ void StandardColumnData::Filter(TransactionData transaction, idx_t vector_index,
 	bool verify_fetch_row = state.scan_options && state.scan_options->force_fetch_row;
 	if (!has_filter || !validity_has_filter || !scan_entire_vector || verify_fetch_row) {
 		// we are not scanning an entire vector - this can have several causes (updates, etc)
-		ColumnData::Filter(transaction, vector_index, state, result, sel, count, filter, filter_state);
+		ColumnData::Filter(transaction, vector_index, state, result, sel, count, filter, filter_state, allow_bitmap);
 		return;
 	}
 	FilterVector(state, result, target_count, sel, count, filter, filter_state);

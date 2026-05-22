@@ -1,18 +1,28 @@
 #include "duckdb/storage/table/column_data.hpp"
 
 #include "duckdb/common/exception/transaction_exception.hpp"
+#include "duckdb/common/types/bitmap_selection_vector.hpp"
+#include "duckdb/common/types/validity_mask.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/function/compression_function.hpp"
 #include "duckdb/function/variant/variant_shredding.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 #include "duckdb/storage/data_pointer.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/column_data_checkpointer.hpp"
+#include "duckdb/storage/table/column_data_filter_bitmap.hpp"
 #include "duckdb/storage/table/list_column_data.hpp"
 #include "duckdb/storage/table/standard_column_data.hpp"
 #include "duckdb/storage/table/array_column_data.hpp"
@@ -26,6 +36,20 @@
 #include "duckdb/storage/table/scan_state.hpp"
 
 namespace duckdb {
+
+static bool IsDirectNullCheckFilter(const TableFilter &filter) {
+	auto &expr = ExpressionFilter::GetExpressionFilter(filter, "ColumnData::IsDirectNullCheckFilter").expr;
+	if (expr->GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) {
+		return false;
+	}
+	auto &op = expr->Cast<BoundOperatorExpression>();
+	if ((op.GetExpressionType() != ExpressionType::OPERATOR_IS_NULL &&
+	     op.GetExpressionType() != ExpressionType::OPERATOR_IS_NOT_NULL) ||
+	    op.children.size() != 1) {
+		return false;
+	}
+	return op.children[0]->GetExpressionClass() == ExpressionClass::BOUND_REF;
+}
 
 ColumnData::ColumnData(BlockManager &block_manager, DataTableInfo &info, idx_t column_index, LogicalType type_p,
                        ColumnDataType data_type_p, optional_ptr<ColumnData> parent_p)
@@ -277,7 +301,7 @@ void ColumnData::FetchUpdates(TransactionData transaction, idx_t vector_index, V
 	if (update_type == UpdateScanType::DISALLOW_UPDATES && updates->HasUncommittedUpdates(vector_index)) {
 		throw TransactionException("Cannot create index with outstanding updates");
 	}
-	result.Flatten(scan_count);
+	result.Flatten();
 	updates->FetchUpdates(transaction, vector_index, result);
 }
 
@@ -289,14 +313,14 @@ void ColumnData::FetchUpdateRow(TransactionData transaction, row_t row_id, Vecto
 	updates->FetchRow(transaction, NumericCast<idx_t>(row_id), result, result_idx);
 }
 
-void ColumnData::UpdateInternal(TransactionData transaction, DataTable &data_table, idx_t column_index,
+void ColumnData::UpdateInternal(TransactionData transaction, DuckTableEntry &table_entry, idx_t column_index,
                                 Vector &update_vector, row_t *row_ids, idx_t update_count, Vector &base_vector,
                                 idx_t row_group_start) {
 	lock_guard<mutex> update_guard(update_lock);
 	if (!updates) {
 		updates = make_uniq<UpdateSegment>(*this);
 	}
-	updates->Update(transaction, data_table, column_index, update_vector, row_ids, update_count, base_vector,
+	updates->Update(transaction, table_entry, column_index, update_vector, row_ids, update_count, base_vector,
 	                row_group_start);
 }
 
@@ -335,10 +359,10 @@ void ColumnData::ScanCommittedRange(idx_t row_group_start, idx_t offset_in_row_g
 	ColumnScanState child_state(nullptr);
 	InitializeScanWithOffset(child_state, offset_in_row_group);
 	bool has_updates = HasUpdates();
-	auto scan_count = ScanVector(child_state, result, s_count, ScanVectorType::SCAN_FLAT_VECTOR);
+	ScanVector(child_state, result, s_count, ScanVectorType::SCAN_FLAT_VECTOR);
 	if (has_updates) {
 		D_ASSERT(result.GetVectorType() == VectorType::FLAT_VECTOR);
-		result.Flatten(scan_count);
+		result.Flatten();
 		updates->FetchCommittedRange(offset_in_row_group, s_count, result);
 	}
 }
@@ -352,277 +376,28 @@ idx_t ColumnData::ScanCount(ColumnScanState &state, Vector &result, idx_t scan_c
 	return ScanVector(state, result, scan_count, ScanVectorType::SCAN_FLAT_VECTOR, result_offset);
 }
 
-//===--------------------------------------------------------------------===//
-// Bitmap-based Filter Evaluation
-//===--------------------------------------------------------------------===//
-// Evaluates TableFilter trees directly on contiguous integer data (FOR stored
-// data or native flat columns), producing a bitmap. Multiple predicates are
-// combined via bitwise AND/OR. The bitmap is converted to a SelectionVector
-// only once at the end. Zero allocations in the hot path.
-
-static constexpr idx_t BM_WORDS = (STANDARD_VECTOR_SIZE + 63) / 64;
-
-static void BitmapSetAll(validity_t *bm) {
-	memset(bm, 0xFF, BM_WORDS * sizeof(validity_t));
-}
-static void BitmapAnd(validity_t *__restrict dst, const validity_t *__restrict src) {
-	for (idx_t i = 0; i < BM_WORDS; i++) {
-		dst[i] &= src[i];
-	}
-}
-static void BitmapOr(validity_t *__restrict dst, const validity_t *__restrict src) {
-	for (idx_t i = 0; i < BM_WORDS; i++) {
-		dst[i] |= src[i];
-	}
-}
-
-static idx_t BitmapToSel(const validity_t *bm, idx_t count, SelectionVector &sel) {
-	idx_t rc = 0;
-	idx_t nwords = (count + 63) / 64;
-	for (idx_t w = 0; w < nwords; w++) {
-		auto bits = bm[w];
-		idx_t base = w * 64;
-		while (bits) {
-			idx_t pos = base + UnsafeNumericCast<idx_t>(__builtin_ctzll(bits));
-			if (pos < count) {
-				sel.set_index(rc++, pos);
-			}
-			bits &= bits - 1;
-		}
-	}
-	return rc;
-}
-
-// Layer 1: comparison loop — the only hot code.
-// Two-pass: (1) compare to byte array — auto-vectorizes to widest SIMD
-// (NEON: 16× uint8, 8× uint16, 4× uint32, 2× uint64 per instruction).
-// (2) pack bytes into bitmap. The comparison dominates and benefits from SIMD;
-// the packing is a fixed cost on L1-cached data.
-template <class T, class OP>
-static void BitmapCompareOp(const T *__restrict data, T constant, idx_t count, validity_t *__restrict bm) {
-	// Pass 1: compare → byte array (auto-vectorizable, no data dependencies)
-	uint8_t cmp[STANDARD_VECTOR_SIZE];
-	for (idx_t i = 0; i < count; i++) {
-		cmp[i] = OP::Operation(data[i], constant);
-	}
-	// Pass 2: pack 8 comparison bytes → 1 bitmap byte
-	auto *out = reinterpret_cast<uint8_t *>(bm);
-	idx_t full = count / 8;
-	for (idx_t b = 0; b < full; b++) {
-		auto *c = cmp + b * 8;
-		out[b] = c[0] | (c[1] << 1) | (c[2] << 2) | (c[3] << 3) |
-		         (c[4] << 4) | (c[5] << 5) | (c[6] << 6) | (c[7] << 7);
-	}
-	if (full * 8 < count) {
-		uint8_t tail = 0;
-		for (idx_t i = full * 8; i < count; i++) {
-			tail |= cmp[i] << (i - full * 8);
-		}
-		out[full] = tail;
-	}
-}
-
-template <class T>
-static void BitmapCompare(const T *data, T constant, idx_t count, ExpressionType cmp, validity_t *bm) {
-	switch (cmp) {
-	case ExpressionType::COMPARE_EQUAL:
-		BitmapCompareOp<T, Equals>(data, constant, count, bm); break;
-	case ExpressionType::COMPARE_NOTEQUAL:
-		BitmapCompareOp<T, NotEquals>(data, constant, count, bm); break;
-	case ExpressionType::COMPARE_LESSTHAN:
-		BitmapCompareOp<T, LessThan>(data, constant, count, bm); break;
-	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		BitmapCompareOp<T, LessThanEquals>(data, constant, count, bm); break;
-	case ExpressionType::COMPARE_GREATERTHAN:
-		BitmapCompareOp<T, GreaterThan>(data, constant, count, bm); break;
-	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-		BitmapCompareOp<T, GreaterThanEquals>(data, constant, count, bm); break;
-	default:
-		break;
-	}
-}
-
-// Layer 2: recursive filter tree evaluation on typed data → bitmap.
-template <class T>
-static bool BitmapEvalFilter(const T *data, idx_t count, const TableFilter &filter, validity_t *result) {
-	switch (filter.filter_type) {
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &cf = filter.Cast<ConstantFilter>();
-		BitmapCompare<T>(data, cf.constant.GetValueUnsafe<T>(), count, cf.comparison_type, result);
-		return true;
-	}
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conj = filter.Cast<ConjunctionAndFilter>();
-		BitmapSetAll(result);
-		validity_t child[BM_WORDS];
-		for (auto &ch : conj.child_filters) {
-			if (!BitmapEvalFilter<T>(data, count, *ch, child)) {
-				return false;
-			}
-			BitmapAnd(result, child);
-		}
-		return true;
-	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conj = filter.Cast<ConjunctionOrFilter>();
-		memset(result, 0, sizeof(validity_t) * BM_WORDS);
-		validity_t child[BM_WORDS];
-		for (auto &ch : conj.child_filters) {
-			if (!BitmapEvalFilter<T>(data, count, *ch, child)) {
-				return false;
-			}
-			BitmapOr(result, child);
-		}
-		return true;
-	}
-	case TableFilterType::IS_NOT_NULL:
-	case TableFilterType::IS_NULL:
-		BitmapSetAll(result);
-		return true;
-	default:
-		return false;
-	}
-}
-
-// FOR wrapper: adjusts constants from logical type to stored unsigned type.
-template <class LT>
-static bool FORConstantBitmapResult(ExpressionType comparison_type, bool all_gt, bool all_lt) {
-	switch (comparison_type) {
-	case ExpressionType::COMPARE_EQUAL:
-		return false;
-	case ExpressionType::COMPARE_NOTEQUAL:
-		return true;
-	case ExpressionType::COMPARE_LESSTHAN:
-		return all_lt;
-	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		return all_lt;
-	case ExpressionType::COMPARE_GREATERTHAN:
-		return all_gt;
-	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-		return all_gt;
-	default:
-		throw InternalException("Unsupported comparison type for FOR bitmap filter");
-	}
-}
-
-template <class LT, class ST>
-static bool BitmapEvalFilterFOR(const ST *data, idx_t count, const TableFilter &filter, validity_t *result, LT min_value,
-                                LT max_value) {
-	switch (filter.filter_type) {
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &cf = filter.Cast<ConstantFilter>();
-		auto constant = cf.constant.GetValueUnsafe<LT>();
-		auto range = FORVector::RangeAnalysis<LT>(constant, min_value, max_value);
-		if (range.all_gt || range.all_lt) {
-			if (FORConstantBitmapResult<LT>(cf.comparison_type, range.all_gt, range.all_lt)) {
-				BitmapSetAll(result);
-			} else {
-				memset(result, 0, sizeof(validity_t) * BM_WORDS);
-			}
-			return true;
-		}
-		uint64_t delta;
-		if (!FORVector::TryGetDelta(constant, min_value, delta)) {
-			return false;
-		}
-		BitmapCompare<ST>(data, UnsafeNumericCast<ST>(delta), count, cf.comparison_type, result);
-		return true;
-	}
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conj = filter.Cast<ConjunctionAndFilter>();
-		BitmapSetAll(result);
-		validity_t child[BM_WORDS];
-		for (auto &ch : conj.child_filters) {
-			if (!BitmapEvalFilterFOR<LT, ST>(data, count, *ch, child, min_value, max_value)) {
-				return false;
-			}
-			BitmapAnd(result, child);
-		}
-		return true;
-	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conj = filter.Cast<ConjunctionOrFilter>();
-		memset(result, 0, sizeof(validity_t) * BM_WORDS);
-		validity_t child[BM_WORDS];
-		for (auto &ch : conj.child_filters) {
-			if (!BitmapEvalFilterFOR<LT, ST>(data, count, *ch, child, min_value, max_value)) {
-				return false;
-			}
-			BitmapOr(result, child);
-		}
-		return true;
-	}
-	default:
-		return BitmapEvalFilter<ST>(data, count, filter, result);
-	}
-}
-
-// Layer 3a: FOR vector entry point.
-static bool TryFORBitmapFilter(Vector &result, idx_t count, const TableFilter &filter, validity_t *bitmap) {
-	if (result.GetVectorType() != VectorType::FOR_VECTOR) {
-		return false;
-	}
-	auto phys = result.GetType().InternalType();
-	if (GetTypeIdSize(phys) <= 1) {
-		return false;
-	}
-	FOR_SWITCH_LOGICAL(phys, LT, {
-		auto stored_type = FORVector::GetStoredType(result);
-		auto *data = FORVector::GetData(result);
-		auto min_value = FORVector::GetMin<LT>(result);
-		auto max_value = FORVector::GetMax<LT>(result);
-		FOR_SWITCH_STORED(stored_type, ST, {
-			return BitmapEvalFilterFOR<LT, ST>(reinterpret_cast<const ST *>(data), count, filter, bitmap, min_value,
-			                                  max_value);
-		});
-	});
-}
-
-// Layer 3b: flat integer vector entry point.
-static bool TryFlatBitmapFilter(Vector &result, idx_t count, const TableFilter &filter, validity_t *bitmap) {
-	if (result.GetVectorType() != VectorType::FLAT_VECTOR) {
-		return false;
-	}
-	auto phys = result.GetType().InternalType();
-	auto *data = FlatVector::GetData(result);
-	switch (phys) {
-	case PhysicalType::INT8:
-		return BitmapEvalFilter<int8_t>(reinterpret_cast<const int8_t *>(data), count, filter, bitmap);
-	case PhysicalType::UINT8:
-		return BitmapEvalFilter<uint8_t>(reinterpret_cast<const uint8_t *>(data), count, filter, bitmap);
-	case PhysicalType::INT16:
-		return BitmapEvalFilter<int16_t>(reinterpret_cast<const int16_t *>(data), count, filter, bitmap);
-	case PhysicalType::UINT16:
-		return BitmapEvalFilter<uint16_t>(reinterpret_cast<const uint16_t *>(data), count, filter, bitmap);
-	case PhysicalType::INT32:
-		return BitmapEvalFilter<int32_t>(reinterpret_cast<const int32_t *>(data), count, filter, bitmap);
-	case PhysicalType::UINT32:
-		return BitmapEvalFilter<uint32_t>(reinterpret_cast<const uint32_t *>(data), count, filter, bitmap);
-	default:
-		return false;
-	}
+idx_t ColumnData::BitmapToSelectionVector(const validity_t *bitmap, idx_t count, SelectionVector &sel) {
+	return duckdb::BitmapToSelectionVector(bitmap, count, sel);
 }
 
 void ColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
                         SelectionVector &sel, idx_t &s_count, const TableFilter &filter,
-                        TableFilterState &filter_state) {
+                        TableFilterState &filter_state, bool allow_bitmap) {
 	idx_t scan_count = Scan(transaction, vector_index, state, result);
+	if (result.GetVectorType() == VectorType::FLAT_VECTOR) {
+		FlatVector::SetSize(result, count_t(scan_count));
+	}
 
-	// Bitmap path: FOR vectors or flat narrow integer columns.
-	// For the first column: bitmap is dense (processes all values).
-	// For subsequent columns with FOR vectors: also use bitmap path to preserve
-	// FOR status for downstream expression evaluation (e.g. FOR × FOR arithmetic).
+	// Bitmap path for FOR vectors: evaluate over the narrow payload and preserve FOR
+	// status for downstream expression evaluation (e.g. FOR x FOR arithmetic).
 	// The bitmap evaluation on all 2048 narrow values is cheap; the benefit is
 	// avoiding Flatten which destroys FOR status and forces full-width copies.
 	bool is_first_column = !sel.IsSet() || s_count == scan_count;
-	// For non-first columns: use bitmap when selectivity is above ~6%.
-	// Below that, the generic selective path processes fewer values.
-	bool try_bitmap = is_first_column ||
-	                  (result.GetVectorType() == VectorType::FOR_VECTOR && s_count > scan_count / 16);
-	if (try_bitmap) {
-		validity_t bitmap[BM_WORDS];
+	bool try_bitmap = result.GetVectorType() == VectorType::FOR_VECTOR;
+	if (allow_bitmap && try_bitmap) {
+		validity_t bitmap[COLUMN_FILTER_BITMAP_WORDS];
 		bool for_bitmap = TryFORBitmapFilter(result, scan_count, filter, bitmap);
-		if (for_bitmap || (is_first_column && TryFlatBitmapFilter(result, scan_count, filter, bitmap))) {
+		if (for_bitmap) {
 			// Track FOR bitmap filter statistics
 			if (state.parent) {
 				state.parent->filter_total_tuples += scan_count;
@@ -630,34 +405,14 @@ void ColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnS
 					state.parent->for_bitmap_tuples += scan_count;
 				}
 			}
-			idx_t nwords = (scan_count + 63) / 64;
 			// AND with validity mask to exclude NULLs
-			const auto &validity = (result.GetVectorType() == VectorType::FOR_VECTOR)
-			                           ? FORVector::Validity(result)
-			                           : FlatVector::Validity(result);
-			if (!validity.CannotHaveNull()) {
-				for (idx_t i = 0; i < nwords; i++) {
-					bitmap[i] &= validity.GetValidityEntry(i);
-				}
-			}
+			ColumnFilterBitmapApplyValidity(result, scan_count, bitmap);
 			// AND with existing selection (for non-first columns)
 			if (!is_first_column && sel.IsSet()) {
-				// Convert existing sel to bitmap, AND
-				validity_t sel_bitmap[BM_WORDS];
-				memset(sel_bitmap, 0, sizeof(sel_bitmap));
-				for (idx_t i = 0; i < s_count; i++) {
-					auto idx = sel.get_index(i);
-					sel_bitmap[idx / 64] |= validity_t(1) << (idx % 64);
-				}
-				for (idx_t i = 0; i < nwords; i++) {
-					bitmap[i] &= sel_bitmap[i];
-				}
+				ColumnFilterBitmapAndSelection(bitmap, scan_count, sel, s_count);
 			}
-			// Convert bitmap → selection vector
-			if (!sel.IsSet()) {
-				sel.Initialize(scan_count);
-			}
-			s_count = BitmapToSel(bitmap, scan_count, sel);
+			// Convert bitmap -> selection vector
+			s_count = duckdb::BitmapToSelectionVector(bitmap, scan_count, sel);
 			return;
 		}
 	}
@@ -667,35 +422,56 @@ void ColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnS
 		state.parent->filter_total_tuples += scan_count;
 	}
 	UnifiedVectorFormat vdata;
-	result.ToUnifiedFormat(scan_count, vdata);
+	result.ToUnifiedFormat(vdata);
 	ColumnSegment::FilterSelection(sel, result, vdata, filter, filter_state, scan_count, s_count);
+}
+
+bool ColumnData::FilterToBitmap(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
+                                SelectionVector &sel, idx_t &s_count, const TableFilter &filter,
+                                TableFilterState &filter_state, validity_t *bitmap,
+                                const validity_t *input_bitmap) {
+	idx_t scan_count = Scan(transaction, vector_index, state, result);
+	if (result.GetVectorType() == VectorType::FLAT_VECTOR) {
+		FlatVector::SetSize(result, count_t(scan_count));
+	}
+
+	if (TryFORBitmapFilter(result, scan_count, filter, bitmap)) {
+		if (state.parent) {
+			state.parent->filter_total_tuples += scan_count;
+			state.parent->for_bitmap_tuples += scan_count;
+		}
+		ColumnFilterBitmapApplyValidity(result, scan_count, bitmap);
+		return true;
+	}
+
+	if (input_bitmap) {
+		s_count = duckdb::BitmapToSelectionVector(input_bitmap, scan_count, sel);
+	}
+	if (state.parent) {
+		state.parent->filter_total_tuples += scan_count;
+	}
+	UnifiedVectorFormat vdata;
+	result.ToUnifiedFormat(vdata);
+	ColumnSegment::FilterSelection(sel, result, vdata, filter, filter_state, scan_count, s_count);
+	return false;
 }
 
 void ColumnData::Select(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
                         SelectionVector &sel, idx_t s_count) {
-	Scan(transaction, vector_index, state, result);
-	// For FOR vectors: gather narrow data in-place instead of creating
-	// DICTIONARY(FOR) which allocates DictionaryBuffer+DictionaryEntry per
-	// chunk. Safe here because filter selections are monotonically increasing
-	// (sel[i] >= i), so the write at position i never overwrites a source
-	// position that hasn't been read yet.
+	idx_t scan_count = Scan(transaction, vector_index, state, result);
+	if (result.GetVectorType() == VectorType::FLAT_VECTOR) {
+		FlatVector::SetSize(result, count_t(scan_count));
+	}
+	// Keep the scan payload as flat FOR and carry the filter selection separately.
+	// Simple FOR-aware operators can ignore the selection while computing the child
+	// payload, then reattach the same selection to their result.
 	if (result.GetVectorType() == VectorType::FOR_VECTOR) {
-		auto stored_type = FORVector::GetStoredType(result);
-		auto *buf = result.GetBuffer()->GetData();
-		FOR_SWITCH_STORED(stored_type, ST, {
-			auto *data = reinterpret_cast<ST *>(buf);
-			for (idx_t i = 0; i < s_count; i++) {
-				data[i] = data[sel.get_index(i)];
-			}
-		});
-		auto &validity = result.GetBuffer()->GetValidityMask();
-		if (validity.CanHaveNull()) {
-			ValidityMask new_validity(s_count);
-			for (idx_t i = 0; i < s_count; i++) {
-				new_validity.Set(i, validity.RowIsValid(sel.get_index(i)));
-			}
-			validity = std::move(new_validity);
+		if (s_count == scan_count) {
+			return;
 		}
+		auto child = Vector::Ref(result);
+		auto entry = make_buffer<DictionaryEntry>(std::move(child));
+		result.Dictionary(std::move(entry), sel, s_count);
 		return;
 	}
 	result.Slice(sel, s_count);
@@ -707,7 +483,7 @@ void ColumnData::Skip(ColumnScanState &state, idx_t s_count) {
 
 void ColumnData::Append(BaseStatistics &append_stats, ColumnAppendState &state, Vector &vector, idx_t append_count) {
 	UnifiedVectorFormat vdata;
-	vector.ToUnifiedFormat(append_count, vdata);
+	vector.ToUnifiedFormat(vdata);
 	AppendData(append_stats, state, vdata, append_count);
 }
 
@@ -727,11 +503,17 @@ FilterPropagateResult ColumnData::CheckZonemap(ColumnScanState &state, TableFilt
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
 	// for dynamic filters we never consider the segment being "checked" as it can always change
-	state.segment_checked = filter.filter_type != TableFilterType::DYNAMIC_FILTER;
+	auto &expr_filter = ExpressionFilter::GetExpressionFilter(filter, "ColumnData::CheckZonemap");
+	bool is_dynamic = ExpressionFilter::ContainsInternalFunction(*expr_filter.expr, DynamicFilterScalarFun::NAME);
+	state.segment_checked = !is_dynamic;
 	FilterPropagateResult prune_result;
 	{
 		lock_guard<mutex> l(stats_lock);
-		prune_result = filter.CheckStatistics(state.current->GetNode().stats.statistics);
+		auto &segment_stats =
+		    IsDirectNullCheckFilter(filter) && !state.child_states.empty() && state.child_states[0].current
+		        ? state.child_states[0].current->GetNode().stats.statistics
+		        : state.current->GetNode().stats.statistics;
+		prune_result = expr_filter.CheckStatistics(segment_stats);
 		if (prune_result == FilterPropagateResult::NO_PRUNING_POSSIBLE) {
 			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 		}
@@ -743,7 +525,7 @@ FilterPropagateResult ColumnData::CheckZonemap(ColumnScanState &state, TableFilt
 	}
 	auto update_stats = updates->GetStatistics();
 	// combine the update and original prune result
-	FilterPropagateResult update_result = filter.CheckStatistics(*update_stats);
+	FilterPropagateResult update_result = expr_filter.CheckStatistics(*update_stats);
 	if (prune_result == update_result) {
 		return prune_result;
 	}
@@ -760,9 +542,11 @@ FilterPropagateResult ColumnData::CheckZonemap(const StorageIndex &index, TableF
 		if (!child_stats) {
 			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 		}
-		return filter.CheckStatistics(*child_stats);
+		auto &expr_filter = ExpressionFilter::GetExpressionFilter(filter, "ColumnData::CheckZonemap");
+		return expr_filter.CheckStatistics(*child_stats);
 	}
-	return filter.CheckStatistics(stats->statistics);
+	auto &expr_filter = ExpressionFilter::GetExpressionFilter(filter, "ColumnData::CheckZonemap");
+	return expr_filter.CheckStatistics(stats->statistics);
 }
 
 const BaseStatistics &ColumnData::GetStatisticsRef() const {
@@ -805,7 +589,7 @@ void ColumnData::InitializeAppend(ColumnAppendState &state) {
 	auto l = data.Lock();
 	if (data.IsEmpty(l)) {
 		// no segments yet, append an empty segment
-		AppendTransientSegment(l, 0);
+		AppendTransientSegment(l, 0, nullptr);
 	}
 	auto segment = data.GetLastSegment(l);
 	auto &last_segment = segment->GetNode();
@@ -813,7 +597,7 @@ void ColumnData::InitializeAppend(ColumnAppendState &state) {
 	    !last_segment.GetCompressionFunction().init_append) {
 		// we cannot append to this segment - append a new segment
 		auto total_rows = segment->GetRowStart() + last_segment.count;
-		AppendTransientSegment(l, total_rows);
+		AppendTransientSegment(l, total_rows, last_segment);
 		state.current = data.GetLastSegment(l);
 	} else {
 		state.current = segment;
@@ -841,7 +625,7 @@ void ColumnData::AppendData(BaseStatistics &append_stats, ColumnAppendState &sta
 		// we couldn't fit everything we wanted in the current column segment, create a new one
 		{
 			auto l = data.Lock();
-			AppendTransientSegment(l, state.current->GetRowStart() + append_segment.count);
+			AppendTransientSegment(l, state.current->GetRowStart() + append_segment.count, append_segment);
 			state.current = data.GetLastSegment(l);
 			state.current->GetNode().InitializeAppend(state);
 		}
@@ -921,49 +705,62 @@ idx_t ColumnData::FetchUpdateData(ColumnScanState &state, row_t *row_ids, Vector
 		throw InternalException("ColumnData::FetchUpdateData out of range");
 	}
 	auto fetch_count = ColumnData::Fetch(state, row_ids[0] - UnsafeNumericCast<row_t>(row_group_start), base_vector);
-	base_vector.Flatten(fetch_count);
+	base_vector.Flatten();
 	return fetch_count;
 }
 
-void ColumnData::Update(TransactionData transaction, DataTable &data_table, idx_t column_index, Vector &update_vector,
-                        row_t *row_ids, idx_t update_count, idx_t row_group_start) {
+void ColumnData::Update(TransactionData transaction, DuckTableEntry &table_entry, idx_t column_index,
+                        Vector &update_vector, row_t *row_ids, idx_t update_count, idx_t row_group_start) {
 	Vector base_vector(type);
 	ColumnScanState state(nullptr);
 	FetchUpdateData(state, row_ids, base_vector, row_group_start);
 
-	UpdateInternal(transaction, data_table, column_index, update_vector, row_ids, update_count, base_vector,
+	UpdateInternal(transaction, table_entry, column_index, update_vector, row_ids, update_count, base_vector,
 	               row_group_start);
 }
 
-void ColumnData::UpdateColumn(TransactionData transaction, DataTable &data_table, const vector<column_t> &column_path,
-                              Vector &update_vector, row_t *row_ids, idx_t update_count, idx_t depth,
-                              idx_t row_group_start) {
+void ColumnData::UpdateColumn(TransactionData transaction, DuckTableEntry &table_entry,
+                              const vector<column_t> &column_path, Vector &update_vector, row_t *row_ids,
+                              idx_t update_count, idx_t depth, idx_t row_group_start) {
 	// this method should only be called at the end of the path in the base column case
 	D_ASSERT(depth >= column_path.size());
-	ColumnData::Update(transaction, data_table, column_path[0], update_vector, row_ids, update_count, row_group_start);
+	ColumnData::Update(transaction, table_entry, column_path[0], update_vector, row_ids, update_count, row_group_start);
 }
 
-void ColumnData::AppendTransientSegment(SegmentLock &l, idx_t start_row) {
-	const auto block_size = block_manager.GetBlockSize();
-	const auto type_size = GetTypeIdSize(type.InternalType());
-	auto vector_segment_size = block_size;
-
-	if (data_type == ColumnDataType::INITIAL_TRANSACTION_LOCAL && start_row == 0) {
-#if STANDARD_VECTOR_SIZE < 1024
-		vector_segment_size = 1024 * type_size;
-#else
-		vector_segment_size = STANDARD_VECTOR_SIZE * type_size;
-#endif
-	}
-
-	// The segment size is bound by the block size, but can be smaller.
-	idx_t segment_size = block_size < vector_segment_size ? block_size : vector_segment_size;
-	allocation_size += segment_size;
-
+void ColumnData::AppendTransientSegment(SegmentLock &l, idx_t start_row, optional_ptr<ColumnSegment> prev_segment) {
 	auto &db = GetDatabase();
 	auto &config = DBConfig::GetConfig(db);
-	auto function = config.GetCompressionFunction(CompressionType::COMPRESSION_UNCOMPRESSED, type.InternalType());
 
+	idx_t segment_size;
+	if (!prev_segment) {
+		// We start with the `initial_bytes` setting, but we ensure that we have enough space for at least one row.
+		const auto initial_bytes = Settings::Get<InitialColumnSegmentSizeSetting>(config);
+		segment_size = MaxValue<idx_t>(GetTypeIdSize(type.InternalType()), initial_bytes);
+	} else {
+		segment_size = prev_segment->SegmentSize() * 2;
+	}
+
+	// BIT (validity) segments can only hold rows in multiples of STANDARD_VECTOR_SIZE;
+	// any segment below STANDARD_MASK_SIZE triggers a dead-segment overflow chain
+	if (type.InternalType() == PhysicalType::BIT) {
+		segment_size = MaxValue(segment_size, ValidityMask::STANDARD_MASK_SIZE);
+	}
+
+	// We set the segment size to the next power of two minus the block header size to
+	// ensure that we have fixed-size segments which we can group when offloading to temporary storage.
+	// FIXME: turn this into the min. temporary buffer size instead of a magical number,
+	// FIXME: once we allow offloading tinier buffers.
+	if (segment_size >= 1024) {
+		const auto block_header_size = block_manager.GetBlockHeaderSize();
+		segment_size = NextPowerOfTwo(segment_size) - block_header_size;
+	}
+
+	// The maximum segment size is always the block size of the corresponding block manager.
+	const auto block_size = block_manager.GetBlockSize();
+	segment_size = MinValue<idx_t>(block_size, segment_size);
+	allocation_size += segment_size;
+
+	auto function = config.GetCompressionFunction(CompressionType::COMPRESSION_UNCOMPRESSED, type.InternalType());
 	auto new_segment = ColumnSegment::CreateTransientSegment(db, function, type, segment_size, block_manager);
 	AppendSegment(l, std::move(new_segment));
 }

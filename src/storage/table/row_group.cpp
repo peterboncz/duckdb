@@ -20,6 +20,7 @@
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/row_version_manager.hpp"
+#include "duckdb/storage/table/scan_filter_bitmap.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
@@ -750,6 +751,25 @@ void RowGroup::Scan(ScanOptions options, CollectionScanState &state, DataChunk &
 			} else {
 				sel.Initialize(nullptr);
 			}
+			validity_t accumulated_filter_bitmap[TABLE_SCAN_FILTER_BITMAP_WORDS];
+			validity_t current_filter_bitmap[TABLE_SCAN_FILTER_BITMAP_WORDS];
+			bool filter_bitmap_active = false;
+			if (has_filters) {
+				if (count != max_count) {
+					ScanFilterBitmapFromSelection(accumulated_filter_bitmap, sel, approved_tuple_count);
+				} else {
+					ScanFilterBitmapSetAll(accumulated_filter_bitmap, max_count);
+				}
+				filter_bitmap_active = true;
+			}
+			auto materialize_filter_bitmap = [&]() {
+				if (!filter_bitmap_active) {
+					return;
+				}
+				approved_tuple_count =
+				    ColumnData::BitmapToSelectionVector(accumulated_filter_bitmap, max_count, sel);
+				filter_bitmap_active = false;
+			};
 			//! first, we scan the columns with filters, fetch their data and generate a selection vector.
 			//! get runtime statistics
 			auto adaptive_filter = filter_info.GetAdaptiveFilter();
@@ -776,9 +796,27 @@ void RowGroup::Scan(ScanOptions options, CollectionScanState &state, DataChunk &
 						continue;
 					}
 					auto &col_data = GetColumn(column_idx);
+					if (filter_bitmap_active) {
+						const auto *input_bitmap = approved_tuple_count == max_count ? nullptr : accumulated_filter_bitmap;
+						if (col_data.FilterToBitmap(transaction, state.vector_index, state.column_scans[scan_idx],
+						                           result_vector, sel, approved_tuple_count, filter.filter,
+						                           table_filter_state, current_filter_bitmap, input_bitmap)) {
+							ScanFilterBitmapAnd(accumulated_filter_bitmap, current_filter_bitmap, max_count);
+							approved_tuple_count = ScanFilterBitmapCount(accumulated_filter_bitmap, max_count);
+							continue;
+						}
+						filter_bitmap_active = false;
+						if (approved_tuple_count > 0) {
+							ScanFilterBitmapFromSelection(accumulated_filter_bitmap, sel, approved_tuple_count);
+							filter_bitmap_active = true;
+						}
+						continue;
+					}
+					materialize_filter_bitmap();
 					col_data.Filter(transaction, state.vector_index, state.column_scans[scan_idx], result_vector, sel,
-					                approved_tuple_count, filter.filter, table_filter_state);
+					                approved_tuple_count, filter.filter, table_filter_state, false);
 				}
+				materialize_filter_bitmap();
 				for (auto &table_filter : filter_list) {
 					if (table_filter.IsAlwaysTrue()) {
 						continue;
@@ -788,14 +826,14 @@ void RowGroup::Scan(ScanOptions options, CollectionScanState &state, DataChunk &
 					// Safe: filter selections are monotonically increasing (sel[i]>=i).
 					if (vec.GetVectorType() == VectorType::FOR_VECTOR) {
 						auto stored_type = FORVector::GetStoredType(vec);
-						auto *buf = vec.GetBuffer()->GetData();
+						auto *buf = vec.BufferMutable().GetData();
 						FOR_SWITCH_STORED(stored_type, ST, {
 							auto *data = reinterpret_cast<ST *>(buf);
 							for (idx_t i = 0; i < approved_tuple_count; i++) {
 								data[i] = data[sel.get_index(i)];
 							}
 						});
-						auto &validity = vec.GetBuffer()->GetValidityMask();
+						auto &validity = vec.BufferMutable().GetValidityMask();
 						if (validity.CanHaveNull()) {
 							ValidityMask new_validity(approved_tuple_count);
 							for (idx_t i = 0; i < approved_tuple_count; i++) {

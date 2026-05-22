@@ -841,8 +841,9 @@ void Vector::Deserialize(Deserializer &deserializer, idx_t count) {
 }
 
 void Vector::SetVectorType(VectorType new_vector_type) {
-	if (new_vector_type != VectorType::FLAT_VECTOR && new_vector_type != VectorType::CONSTANT_VECTOR) {
-		throw InternalException("SetVectorType can only be used with FLAT / CONSTANT vectors");
+	if (new_vector_type != VectorType::FLAT_VECTOR && new_vector_type != VectorType::CONSTANT_VECTOR &&
+	    new_vector_type != VectorType::FOR_VECTOR) {
+		throw InternalException("SetVectorType can only be used with FLAT / CONSTANT / FOR vectors");
 	}
 	if (buffer) {
 		// FIXME: should we allow vectors without a buffer?

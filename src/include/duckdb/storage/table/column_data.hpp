@@ -18,6 +18,7 @@
 #include "duckdb/common/enums/scan_vector_type.hpp"
 #include "duckdb/common/serializer/serialization_traits.hpp"
 #include "duckdb/common/atomic_ptr.hpp"
+#include "duckdb/common/types/validity_mask.hpp"
 
 namespace duckdb {
 class ColumnData;
@@ -144,9 +145,16 @@ public:
 
 	//! Select
 	virtual void Filter(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
-	                    SelectionVector &sel, idx_t &count, const TableFilter &filter, TableFilterState &filter_state);
+	                    SelectionVector &sel, idx_t &count, const TableFilter &filter, TableFilterState &filter_state,
+	                    bool allow_bitmap = true);
+	virtual bool FilterToBitmap(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
+	                            SelectionVector &sel, idx_t &count, const TableFilter &filter,
+	                            TableFilterState &filter_state, validity_t *bitmap,
+	                            const validity_t *input_bitmap = nullptr);
 	virtual void Select(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
 	                    SelectionVector &sel, idx_t count);
+
+	static idx_t BitmapToSelectionVector(const validity_t *bitmap, idx_t count, SelectionVector &sel);
 
 	//! Skip the scan forward by "count" rows
 	virtual void Skip(ColumnScanState &state, idx_t count = STANDARD_VECTOR_SIZE);

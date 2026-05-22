@@ -16,6 +16,7 @@ namespace duckdb {
 
 class Expression;
 class BoundFunctionExpression;
+class DictionaryBuffer;
 class ExpressionExecutor;
 struct ExpressionExecutorState;
 struct FunctionLocalState;
@@ -69,6 +70,8 @@ public:
 
 	bool TryExecuteDictionaryExpression(const BoundFunctionExpression &expr, DataChunk &args, ExpressionState &state,
 	                                    Vector &result);
+	bool TryExecuteSlicedDictionaryExpression(const BoundFunctionExpression &expr, DataChunk &args,
+	                                          ExpressionState &state, Vector &result);
 
 	void ResetDictionaryStates() override;
 
@@ -82,8 +85,17 @@ private:
 	optional_idx input_col_idx;
 	//! Vector holding the expression executed on the entire dictionary
 	buffer_ptr<DictionaryEntry> output_dictionary;
+	//! Cached dictionary wrapper for the regular storage dictionary expression result
+	buffer_ptr<DictionaryBuffer> output_dictionary_buffer;
+	//! Cached input chunk used when evaluating over a sliced DICTIONARY(FOR) child
+	DataChunk sliced_dictionary_input;
+	//! Cached dictionary wrapper for sliced dictionary expression results
+	buffer_ptr<DictionaryEntry> sliced_dictionary_output;
+	buffer_ptr<DictionaryBuffer> sliced_dictionary_buffer;
 	//! ID of the input dictionary Vector
 	string current_input_dictionary_id;
+	//! Whether this expression is safe to evaluate over a larger sliced dictionary child
+	bool dictionary_eligible = false;
 };
 
 struct ExpressionExecutorState {

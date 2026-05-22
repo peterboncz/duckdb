@@ -1,4 +1,5 @@
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -16,6 +17,7 @@ ExecuteFunctionState::ExecuteFunctionState(const Expression &expr, ExpressionExe
 	if (expr.GetReturnType().InternalType() == PhysicalType::STRUCT) {
 		return; // FIXME: get this working for STRUCT
 	}
+	dictionary_eligible = true;
 
 	// Set input_col_idx accordingly, marking the expression as eligible for dictionary optimization
 	switch (expr.GetExpressionClass()) {
@@ -46,10 +48,100 @@ ExecuteFunctionState::ExecuteFunctionState(const Expression &expr, ExpressionExe
 ExecuteFunctionState::~ExecuteFunctionState() {
 }
 
+bool ExecuteFunctionState::TryExecuteSlicedDictionaryExpression(const BoundFunctionExpression &expr, DataChunk &args,
+                                                               ExpressionState &state, Vector &result) {
+	static constexpr idx_t MIN_SLICED_DICTIONARY_COUNT = 256;
+
+	if (!dictionary_eligible || args.size() <= MIN_SLICED_DICTIONARY_COUNT) {
+		return false;
+	}
+
+	const SelectionVector *dict_sel = nullptr;
+	optional_idx dict_size;
+	bool has_dictionary = false;
+	bool has_for_child = false;
+	for (idx_t col_idx = 0; col_idx < args.ColumnCount(); col_idx++) {
+		auto &arg = args.data[col_idx];
+		if (arg.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+			continue;
+		}
+		if (arg.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
+			return false;
+		}
+		if (!DictionaryVector::DictionaryId(arg).empty()) {
+			return false;
+		}
+		auto &child = DictionaryVector::Child(arg);
+		if (child.GetVectorType() != VectorType::FLAT_VECTOR && child.GetVectorType() != VectorType::FOR_VECTOR) {
+			return false;
+		}
+		has_for_child = has_for_child || child.GetVectorType() == VectorType::FOR_VECTOR;
+		auto child_size = DictionaryVector::DictionarySize(arg);
+		if (!child_size.IsValid() || child_size.GetIndex() > STANDARD_VECTOR_SIZE) {
+			return false;
+		}
+		auto &sel = DictionaryVector::SelVector(arg);
+		if (!dict_sel) {
+			dict_sel = &sel;
+			dict_size = child_size;
+		} else if (dict_sel->data() != sel.data() || dict_size.GetIndex() != child_size.GetIndex()) {
+			return false;
+		}
+		has_dictionary = true;
+	}
+	if (!has_dictionary || !dict_sel || !dict_size.IsValid()) {
+		return false;
+	}
+	if (!has_for_child) {
+		return false;
+	}
+
+	if (sliced_dictionary_input.ColumnCount() != args.ColumnCount()) {
+		sliced_dictionary_input.Destroy();
+		sliced_dictionary_input.InitializeEmpty(args.GetTypes());
+	}
+	for (idx_t col_idx = 0; col_idx < args.ColumnCount(); col_idx++) {
+		auto &arg = args.data[col_idx];
+		if (arg.GetVectorType() == VectorType::DICTIONARY_VECTOR) {
+			sliced_dictionary_input.data[col_idx].Reference(DictionaryVector::Child(arg));
+		} else {
+			sliced_dictionary_input.data[col_idx].Reference(arg);
+		}
+	}
+
+	const auto child_count = dict_size.GetIndex();
+	sliced_dictionary_input.SetCardinality(child_count);
+	expr.function.GetFunctionCallback()(sliced_dictionary_input, state, result);
+	auto child_result_type = result.GetVectorType();
+	if (child_result_type == VectorType::FLAT_VECTOR || child_result_type == VectorType::CONSTANT_VECTOR ||
+	    child_result_type == VectorType::FOR_VECTOR) {
+		FlatVector::SetSize(result, child_count);
+	}
+
+	if (!sliced_dictionary_output) {
+		sliced_dictionary_output = make_buffer<DictionaryEntry>(Vector(result.GetType(), nullptr));
+	}
+	sliced_dictionary_output->data.Reference(result);
+	sliced_dictionary_output->cached_hashes.reset();
+	if (!sliced_dictionary_buffer) {
+		sliced_dictionary_buffer = make_buffer<DictionaryBuffer>(*dict_sel, args.size(), sliced_dictionary_output);
+	} else {
+		sliced_dictionary_buffer->SetEntry(sliced_dictionary_output);
+		sliced_dictionary_buffer->SetSelVector(*dict_sel);
+		sliced_dictionary_buffer->SetVectorSizeOnly(args.size());
+	}
+	result.SetBuffer(sliced_dictionary_buffer);
+	return true;
+}
+
 bool ExecuteFunctionState::TryExecuteDictionaryExpression(const BoundFunctionExpression &expr, DataChunk &args,
                                                           ExpressionState &state, Vector &result) {
 	static constexpr idx_t MAX_DICTIONARY_SIZE_THRESHOLD = 20000;
 	static constexpr double CHUNK_FILL_RATIO_THRESHOLD = 0.5;
+
+	if (TryExecuteSlicedDictionaryExpression(expr, args, state, result)) {
+		return true;
+	}
 
 	if (!input_col_idx.IsValid()) {
 		return false; // This expression is not eligible for dictionary optimization
@@ -115,8 +207,17 @@ bool ExecuteFunctionState::TryExecuteDictionaryExpression(const BoundFunctionExp
 		}
 	}
 
-	// Result references the dictionary
-	result.Dictionary(output_dictionary, DictionaryVector::SelVector(unary_input), args.size());
+	// Result references the dictionary. Reuse the wrapper; the dictionary entry itself is
+	// cached above and rebuilt only when the storage dictionary id changes.
+	auto &sel = DictionaryVector::SelVector(unary_input);
+	if (!output_dictionary_buffer) {
+		output_dictionary_buffer = make_buffer<DictionaryBuffer>(sel, args.size(), output_dictionary);
+	} else {
+		output_dictionary_buffer->SetEntry(output_dictionary);
+		output_dictionary_buffer->SetSelVector(sel);
+		output_dictionary_buffer->SetVectorSizeOnly(args.size());
+	}
+	result.SetBuffer(output_dictionary_buffer);
 
 	return true;
 }
@@ -125,6 +226,7 @@ void ExecuteFunctionState::ResetDictionaryStates() {
 	// Clear the cached dictionary information
 	current_input_dictionary_id.clear();
 	output_dictionary.reset();
+	output_dictionary_buffer.reset();
 
 	for (const auto &child_state : child_states) {
 		child_state->ResetDictionaryStates();

@@ -23,17 +23,16 @@ TEST_CASE("FOR Vector - basic creation and flatten", "[for_vector]") {
 	// Create a FOR vector: int64 values [1000, 1001, 1002, 1003, 1004]
 	idx_t count = 5;
 	Vector vec(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(vec, PhysicalType::UINT16, 1000, 3);
+	FORVector::Create<int64_t>(vec, PhysicalType::UINT16, 1004);
 
 	auto stored_data = reinterpret_cast<uint16_t *>(FORVector::GetData(vec));
 	for (idx_t i = 0; i < count; i++) {
-		stored_data[i] = NumericCast<uint16_t>(i);
+		stored_data[i] = NumericCast<uint16_t>(1000 + i);
 	}
 
 	REQUIRE(vec.GetVectorType() == VectorType::FOR_VECTOR);
 	REQUIRE(FORVector::GetStoredType(vec) == PhysicalType::UINT16);
-	REQUIRE(FORVector::GetMin<int64_t>(vec) == 1000);
-	REQUIRE(FORVector::GetMax<int64_t>(vec) == 1007);
+	REQUIRE(FORVector::GetMax<int64_t>(vec) == 1004);
 
 	// Test GetValue
 	for (idx_t i = 0; i < count; i++) {
@@ -42,7 +41,7 @@ TEST_CASE("FOR Vector - basic creation and flatten", "[for_vector]") {
 	}
 
 	// Test Flatten
-	vec.Flatten(count);
+	vec.Flatten();
 	REQUIRE(vec.GetVectorType() == VectorType::FLAT_VECTOR);
 	auto flat_data = FlatVector::GetData<int64_t>(vec);
 	for (idx_t i = 0; i < count; i++) {
@@ -52,13 +51,13 @@ TEST_CASE("FOR Vector - basic creation and flatten", "[for_vector]") {
 
 TEST_CASE("FOR Vector - NULL handling", "[for_vector]") {
 	Vector vec(LogicalType::INTEGER);
-	FORVector::Create<int32_t>(vec, PhysicalType::UINT8, 100, 5);
+	FORVector::Create<int32_t>(vec, PhysicalType::UINT8, 130);
 
 	auto stored_data = reinterpret_cast<uint8_t *>(FORVector::GetData(vec));
-	stored_data[0] = 0;
-	stored_data[1] = 10;
-	stored_data[2] = 20;
-	stored_data[3] = 30;
+	stored_data[0] = 100;
+	stored_data[1] = 110;
+	stored_data[2] = 120;
+	stored_data[3] = 130;
 
 	// Set element 1 and 3 as NULL
 	FORVector::Validity(vec).SetInvalid(1);
@@ -75,14 +74,14 @@ TEST_CASE("FOR Vector - comparison with constant", "[for_vector]") {
 
 	// Create FOR vector with values [100, 110, 120, 130, 140]
 	Vector for_vec(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(for_vec, PhysicalType::UINT8, 100, 6);
+	FORVector::Create<int64_t>(for_vec, PhysicalType::UINT8, 140);
 	auto stored_data = reinterpret_cast<uint8_t *>(FORVector::GetData(for_vec));
 	for (idx_t i = 0; i < count; i++) {
-		stored_data[i] = NumericCast<uint8_t>(i * 10);
+		stored_data[i] = NumericCast<uint8_t>(100 + i * 10);
 	}
 
 	// Test: for_vec == 120
-	Vector const_vec(Value::BIGINT(120));
+	Vector const_vec(Value::BIGINT(120), count_t(1));
 	SelectionVector true_sel(count);
 	SelectionVector false_sel(count);
 
@@ -108,22 +107,28 @@ TEST_CASE("FOR Vector - comparison between two FOR vectors", "[for_vector]") {
 	// left:  [100, 200, 150, 300] stored as uint16 delta from 0
 	// right: [150, 150, 150, 150] stored as uint16 delta from 0
 	Vector left(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(left, PhysicalType::UINT16, 0, 9);
+	FORVector::Create<int64_t>(left, PhysicalType::UINT16, 300);
 	auto ldata = reinterpret_cast<uint16_t *>(FORVector::GetData(left));
-	ldata[0] = 100; ldata[1] = 200; ldata[2] = 150; ldata[3] = 300;
+	ldata[0] = 100;
+	ldata[1] = 200;
+	ldata[2] = 150;
+	ldata[3] = 300;
 
 	Vector right(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(right, PhysicalType::UINT16, 0, 8);
+	FORVector::Create<int64_t>(right, PhysicalType::UINT16, 150);
 	auto rdata = reinterpret_cast<uint16_t *>(FORVector::GetData(right));
-	rdata[0] = 150; rdata[1] = 150; rdata[2] = 150; rdata[3] = 150;
+	rdata[0] = 150;
+	rdata[1] = 150;
+	rdata[2] = 150;
+	rdata[3] = 150;
 
 	SelectionVector true_sel(count), false_sel(count);
 	auto match = VectorOperations::LessThan(left, right, nullptr, count, &true_sel, &false_sel);
-	REQUIRE(match == 1);       // only index 0: 100 < 150
+	REQUIRE(match == 1); // only index 0: 100 < 150
 	REQUIRE(true_sel.get_index(0) == 0);
 
 	match = VectorOperations::Equals(left, right, nullptr, count, &true_sel, &false_sel);
-	REQUIRE(match == 1);       // only index 2: 150 == 150
+	REQUIRE(match == 1); // only index 2: 150 == 150
 	REQUIRE(true_sel.get_index(0) == 2);
 }
 
@@ -132,15 +137,15 @@ TEST_CASE("FOR Vector - comparison with out-of-range constant", "[for_vector]") 
 
 	// Create FOR vector with values [100, 101, 102]
 	Vector for_vec(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(for_vec, PhysicalType::UINT8, 100, 2);
+	FORVector::Create<int64_t>(for_vec, PhysicalType::UINT8, 102);
 	auto stored_data = reinterpret_cast<uint8_t *>(FORVector::GetData(for_vec));
 	for (idx_t i = 0; i < count; i++) {
-		stored_data[i] = NumericCast<uint8_t>(i);
+		stored_data[i] = NumericCast<uint8_t>(100 + i);
 	}
 
 	// Constant below base: all values > 50
 	{
-		Vector const_vec(Value::BIGINT(50));
+		Vector const_vec(Value::BIGINT(50), count_t(1));
 		SelectionVector true_sel(count);
 		auto match_count = VectorOperations::GreaterThan(for_vec, const_vec, nullptr, count, &true_sel, nullptr);
 		REQUIRE(match_count == 3); // all values > 50
@@ -148,7 +153,7 @@ TEST_CASE("FOR Vector - comparison with out-of-range constant", "[for_vector]") 
 
 	// Constant above max stored range: all values < 500
 	{
-		Vector const_vec(Value::BIGINT(500));
+		Vector const_vec(Value::BIGINT(500), count_t(1));
 		SelectionVector true_sel(count);
 		auto match_count = VectorOperations::LessThan(for_vec, const_vec, nullptr, count, &true_sel, nullptr);
 		REQUIRE(match_count == 3); // all values < 500
@@ -163,12 +168,12 @@ TEST_CASE("FOR Vector - Slice with non-monotonic selection", "[for_vector]") {
 	// Regression: Slice compaction was done in-place, which corrupted data when
 	// the selection vector was non-monotonic (e.g. [2, 0] overwrites row 0 before reading it).
 	Vector vec(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(vec, PhysicalType::UINT16, 1010, 5);
+	FORVector::Create<int64_t>(vec, PhysicalType::UINT16, 1040);
 	auto stored = reinterpret_cast<uint16_t *>(FORVector::GetData(vec));
-	stored[0] = 0;
-	stored[1] = 10;
-	stored[2] = 20;
-	stored[3] = 30;
+	stored[0] = 1010;
+	stored[1] = 1020;
+	stored[2] = 1030;
+	stored[3] = 1040;
 
 	// Non-monotonic selection: pick rows [2, 0, 3]
 	SelectionVector sel(3);
@@ -178,7 +183,7 @@ TEST_CASE("FOR Vector - Slice with non-monotonic selection", "[for_vector]") {
 	vec.Slice(sel, 3);
 
 	// After Slice, vec should have 3 values: [1030, 1010, 1040]
-	vec.Flatten(3);
+	vec.Flatten();
 	auto data = FlatVector::GetData<int64_t>(vec);
 	REQUIRE(data[0] == 1030);
 	REQUIRE(data[1] == 1010);
@@ -189,7 +194,7 @@ TEST_CASE("FOR Vector - Flatten with selection preserves validity", "[for_vector
 	// Regression: Flatten(sel, count) copied the original validity mask without
 	// remapping through the selection vector, causing wrong NULL positions.
 	Vector vec(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(vec, PhysicalType::UINT8, 0, 2);
+	FORVector::Create<int64_t>(vec, PhysicalType::UINT8, 3);
 	auto stored = reinterpret_cast<uint8_t *>(FORVector::GetData(vec));
 	stored[0] = 0;
 	stored[1] = 1;
@@ -221,7 +226,7 @@ TEST_CASE("FOR Vector - Copy with selection beyond source_count", "[for_vector]"
 	// index beyond the partially-decompressed data.
 	idx_t full_count = 100;
 	Vector vec(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(vec, PhysicalType::UINT16, 0, 7);
+	FORVector::Create<int64_t>(vec, PhysicalType::UINT16, 99);
 	auto stored = reinterpret_cast<uint16_t *>(FORVector::GetData(vec));
 	for (idx_t i = 0; i < full_count; i++) {
 		stored[i] = static_cast<uint16_t>(i);
@@ -248,15 +253,15 @@ TEST_CASE("FOR Vector - hugeint with UINT64 stored type", "[for_vector]") {
 	// vectors backed by UINT64, constants above the FOR max were not detected.
 	idx_t count = 3;
 	Vector vec(LogicalType::HUGEINT);
-	FORVector::Create<hugeint_t>(vec, PhysicalType::UINT64, hugeint_t(0, 1000), 8);
+	FORVector::Create<hugeint_t>(vec, PhysicalType::UINT64, hugeint_t(0, 1200));
 	auto stored = reinterpret_cast<uint64_t *>(FORVector::GetData(vec));
-	stored[0] = 0;
-	stored[1] = 100;
-	stored[2] = 200;
+	stored[0] = 1000;
+	stored[1] = 1100;
+	stored[2] = 1200;
 
 	// Constant far above max: all values should be less than it
 	hugeint_t big_constant(10, 0); // way above base + UINT64_MAX
-	Vector const_vec(Value::HUGEINT(big_constant));
+	Vector const_vec(Value::HUGEINT(big_constant), count_t(1));
 	SelectionVector true_sel(count);
 	auto match_count = VectorOperations::LessThan(vec, const_vec, nullptr, count, &true_sel, nullptr);
 	REQUIRE(match_count == 3); // all values < big_constant
@@ -273,11 +278,10 @@ TEST_CASE("FOR Vector - hugeint with UINT64 stored type", "[for_vector]") {
 // Helper to create a FOR vector with int64 values [start, start+1, ..., start+(count-1)].
 static Vector CreateSimpleFOR(int64_t start, idx_t count) {
 	Vector vec(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(vec, PhysicalType::UINT16, start,
-	                           BitpackingPrimitives::MinimumBitWidth<uint64_t, false>(count - 1));
+	FORVector::Create<int64_t>(vec, PhysicalType::UINT16, start + NumericCast<int64_t>(count) - 1);
 	auto stored_data = reinterpret_cast<uint16_t *>(FORVector::GetData(vec));
 	for (idx_t i = 0; i < count; i++) {
-		stored_data[i] = NumericCast<uint16_t>(i);
+		stored_data[i] = NumericCast<uint16_t>(start + i);
 	}
 	return vec;
 }
@@ -318,8 +322,9 @@ static void ExecuteTernaryFunction(ScalarFunction function, Vector &arg0, Vector
 
 static ScalarFunction GetMultiplyBigintFunction() {
 	for (auto &function : OperatorMultiplyFun::GetFunctions().functions) {
-		if (function.arguments.size() == 2 && function.arguments[0] == LogicalType::BIGINT &&
-		    function.arguments[1] == LogicalType::BIGINT && function.return_type == LogicalType::BIGINT) {
+		auto &sig = function.GetSignature();
+		if (sig.GetParameterCount() == 2 && sig.GetParameter(0).GetType() == LogicalType::BIGINT &&
+		    sig.GetParameter(1).GetType() == LogicalType::BIGINT && sig.GetReturnType() == LogicalType::BIGINT) {
 			return function;
 		}
 	}
@@ -330,13 +335,13 @@ TEST_CASE("FOR Vector - addition with constant", "[for_vector]") {
 	idx_t count = 5;
 	auto for_vec = CreateSimpleFOR(1000, count);
 
-	Vector const_vec(Value::BIGINT(42));
+	Vector const_vec(Value::BIGINT(42), count_t(1));
 	Vector result(LogicalType::BIGINT);
 	ExecuteBinaryFunction(AddFunction::GetFunction(LogicalType::BIGINT, LogicalType::BIGINT), for_vec, const_vec,
 	                      result, count);
 
 	REQUIRE(result.GetVectorType() == VectorType::FOR_VECTOR);
-	result.Flatten(count);
+	result.Flatten();
 	auto data = FlatVector::GetData<int64_t>(result);
 	for (idx_t i = 0; i < count; i++) {
 		REQUIRE(data[i] == static_cast<int64_t>(1042 + i));
@@ -347,12 +352,12 @@ TEST_CASE("FOR Vector - multiplication with constant", "[for_vector]") {
 	idx_t count = 5;
 	auto for_vec = CreateSimpleFOR(100, count);
 
-	Vector const_vec(Value::BIGINT(3));
+	Vector const_vec(Value::BIGINT(3), count_t(1));
 	Vector result(LogicalType::BIGINT);
 	ExecuteBinaryFunction(GetMultiplyBigintFunction(), for_vec, const_vec, result, count);
 
 	REQUIRE(result.GetVectorType() == VectorType::FOR_VECTOR);
-	result.Flatten(count);
+	result.Flatten();
 	auto data = FlatVector::GetData<int64_t>(result);
 	for (idx_t i = 0; i < count; i++) {
 		REQUIRE(data[i] == static_cast<int64_t>((100 + i) * 3));
@@ -363,19 +368,19 @@ TEST_CASE("FOR Vector - addition with negative constant", "[for_vector]") {
 	idx_t count = 3;
 	auto for_vec = CreateSimpleFOR(1000, count);
 
-	Vector const_vec(Value::BIGINT(-500));
+	Vector const_vec(Value::BIGINT(-500), count_t(1));
 	Vector result(LogicalType::BIGINT);
 	BinaryExecutor::ExecuteStandard<int64_t, int64_t, int64_t, AddOperatorOverflowCheck>(for_vec, const_vec, result,
 	                                                                                     count);
 
-	result.Flatten(count);
+	result.Flatten();
 	auto data = FlatVector::GetData<int64_t>(result);
 	for (idx_t i = 0; i < count; i++) {
 		REQUIRE(data[i] == static_cast<int64_t>(500 + i));
 	}
 }
 
-TEST_CASE("FOR Vector - compressed materialization decompress with nonzero min", "[for_vector]") {
+TEST_CASE("FOR Vector - compressed materialization decompress uses absolute payload", "[for_vector]") {
 	idx_t count = 4;
 	Vector compressed(LogicalType::UTINYINT);
 	auto compressed_data = FlatVector::GetDataMutable<uint8_t>(compressed);
@@ -384,34 +389,35 @@ TEST_CASE("FOR Vector - compressed materialization decompress with nonzero min",
 	compressed_data[2] = 20;
 	compressed_data[3] = 30;
 
-	Vector min_vec(Value::BIGINT(1000));
-	Vector max_vec(Value::BIGINT(1255));
+	Vector min_vec(Value::BIGINT(1000), count_t(1));
+	Vector max_vec(Value::BIGINT(30), count_t(1));
 	Vector result(LogicalType::BIGINT);
 	auto decompress = CMIntegralDecompressFun::GetFunction(LogicalType::UTINYINT, LogicalType::BIGINT);
 	ExecuteTernaryFunction(decompress, compressed, min_vec, max_vec, result, count);
 
 	REQUIRE(result.GetVectorType() == VectorType::FOR_VECTOR);
 	REQUIRE(FORVector::GetStoredType(result) == PhysicalType::UINT8);
-	REQUIRE(FORVector::GetMin<int64_t>(result) == 1000);
-	REQUIRE(FORVector::GetMax<int64_t>(result) == 1255);
-	result.Flatten(count);
+	REQUIRE(FORVector::GetMax<int64_t>(result) == 30);
+	result.Flatten();
 	auto data = FlatVector::GetData<int64_t>(result);
-	REQUIRE(data[0] == 1000);
-	REQUIRE(data[1] == 1010);
-	REQUIRE(data[2] == 1020);
-	REQUIRE(data[3] == 1030);
+	REQUIRE(data[0] == 0);
+	REQUIRE(data[1] == 10);
+	REQUIRE(data[2] == 20);
+	REQUIRE(data[3] == 30);
 }
 
 TEST_CASE("FOR Vector - arithmetic between two FOR vectors", "[for_vector]") {
 	idx_t count = 4;
-	auto left = CreateSimpleFOR(100, count);   // [100, 101, 102, 103]
-	auto right = CreateSimpleFOR(200, count);  // [200, 201, 202, 203]
+	auto left = CreateSimpleFOR(100, count);  // [100, 101, 102, 103]
+	auto right = CreateSimpleFOR(200, count); // [200, 201, 202, 203]
 	Vector result(LogicalType::BIGINT);
-	ExecuteBinaryFunction(AddFunction::GetFunction(LogicalType::BIGINT, LogicalType::BIGINT), left, right, result, count);
+	ExecuteBinaryFunction(AddFunction::GetFunction(LogicalType::BIGINT, LogicalType::BIGINT), left, right, result,
+	                      count);
 	REQUIRE(result.GetVectorType() == VectorType::FOR_VECTOR); // proves FOR path fired
-	result.Flatten(count);
+	result.Flatten();
 	auto data = FlatVector::GetData<int64_t>(result);
-	for (idx_t i = 0; i < count; i++) REQUIRE(data[i] == static_cast<int64_t>(300 + 2 * i));
+	for (idx_t i = 0; i < count; i++)
+		REQUIRE(data[i] == static_cast<int64_t>(300 + 2 * i));
 }
 
 TEST_CASE("FOR Vector - DataChunk::Append preserves FOR", "[for_vector]") {
@@ -422,8 +428,7 @@ TEST_CASE("FOR Vector - DataChunk::Append preserves FOR", "[for_vector]") {
 	// First append: manually set target to FOR (as CachingOperator does), then Append
 	auto src1 = CreateSimpleFOR(100, 5);
 	target.data[0].SetVectorType(VectorType::FOR_VECTOR);
-	FORVector::SetMetadata<int64_t>(target.data[0], FORVector::GetStoredType(src1), FORVector::GetMin<int64_t>(src1),
-	                                FORVector::GetRangeBits(src1));
+	FORVector::SetMetadata<int64_t>(target.data[0], FORVector::GetStoredType(src1), FORVector::GetMax<int64_t>(src1));
 	DataChunk chunk1;
 	chunk1.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT});
 	chunk1.data[0].Reference(src1);
@@ -432,18 +437,18 @@ TEST_CASE("FOR Vector - DataChunk::Append preserves FOR", "[for_vector]") {
 	REQUIRE(target.data[0].GetVectorType() == VectorType::FOR_VECTOR);
 	REQUIRE(target.size() == 5);
 
-	// Second append: incompatible metadata releases the FOR run and falls back to flat copy
+	// Second append: same stored type remains FOR and merges max metadata
 	auto src2 = CreateSimpleFOR(200, 3);
 	DataChunk chunk2;
 	chunk2.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT});
 	chunk2.data[0].Reference(src2);
 	chunk2.SetCardinality(3);
 	target.Append(chunk2);
-	REQUIRE(target.data[0].GetVectorType() == VectorType::FLAT_VECTOR);
+	REQUIRE(target.data[0].GetVectorType() == VectorType::FOR_VECTOR);
 	REQUIRE(target.size() == 8);
 
 	// Verify values after flatten
-	target.data[0].Flatten(8);
+	target.data[0].Flatten();
 	auto data = FlatVector::GetData<int64_t>(target.data[0]);
 	REQUIRE(data[0] == 100);
 	REQUIRE(data[4] == 104);
@@ -453,9 +458,11 @@ TEST_CASE("FOR Vector - DataChunk::Append preserves FOR", "[for_vector]") {
 
 TEST_CASE("FOR Vector - TryWidenType preserves FOR across type widening", "[for_vector]") {
 	Vector source(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(source, PhysicalType::UINT16, 100, 9);
+	FORVector::Create<int64_t>(source, PhysicalType::UINT16, 500);
 	auto stored = reinterpret_cast<uint16_t *>(FORVector::GetData(source));
-	stored[0] = 0; stored[1] = 100; stored[2] = 400;
+	stored[0] = 100;
+	stored[1] = 200;
+	stored[2] = 500;
 
 	Vector result(LogicalType::HUGEINT);
 	REQUIRE(FORVector::TryWidenType(source, result));
@@ -464,7 +471,7 @@ TEST_CASE("FOR Vector - TryWidenType preserves FOR across type widening", "[for_
 	// Verify the buffer is shared (zero-copy)
 	REQUIRE(FORVector::GetData(result) == FORVector::GetData(source));
 	// Verify values decompress correctly as hugeint
-	result.Flatten(3);
+	result.Flatten();
 	auto data = FlatVector::GetData<hugeint_t>(result);
 	REQUIRE(data[0] == hugeint_t(0, 100));
 	REQUIRE(data[1] == hugeint_t(0, 200));
@@ -472,23 +479,25 @@ TEST_CASE("FOR Vector - TryWidenType preserves FOR across type widening", "[for_
 }
 
 TEST_CASE("FOR Vector - compress fast path on FOR input", "[for_vector]") {
-	// Create FOR vector simulating scan output, then compress (subtract min_val)
+	// Create FOR vector simulating scan output, then compress as a no-op stored view
 	idx_t count = 4;
 	Vector for_vec(LogicalType::BIGINT);
-	FORVector::Create<int64_t>(for_vec, PhysicalType::UINT16, 1000, 5);
+	FORVector::Create<int64_t>(for_vec, PhysicalType::UINT16, 1030);
 	auto stored = reinterpret_cast<uint16_t *>(FORVector::GetData(for_vec));
-	stored[0] = 0; stored[1] = 10; stored[2] = 20; stored[3] = 30;
+	stored[0] = 1000;
+	stored[1] = 1010;
+	stored[2] = 1020;
+	stored[3] = 1030;
 
-	// Compress: subtract min_val=1000, result type UTINYINT (fits 0..30)
-	Vector min_vec(Value::BIGINT(1000));
-	Vector result(LogicalType::UTINYINT);
-	auto compress = CMIntegralCompressFun::GetFunction(LogicalType::BIGINT, LogicalType::UTINYINT);
+	// Compress: min_val is ignored, result type matches the FOR stored type
+	Vector min_vec(Value::BIGINT(1000), count_t(1));
+	Vector result(LogicalType::USMALLINT);
+	auto compress = CMIntegralCompressFun::GetFunction(LogicalType::BIGINT, LogicalType::USMALLINT);
 	ExecuteBinaryFunction(compress, for_vec, min_vec, result, count);
 
-	// Result should be FLAT UTINYINT with values [0, 10, 20, 30]
-	auto data = FlatVector::GetData<uint8_t>(result);
-	REQUIRE(data[0] == 0);
-	REQUIRE(data[1] == 10);
-	REQUIRE(data[2] == 20);
-	REQUIRE(data[3] == 30);
+	auto data = FlatVector::GetData<uint16_t>(result);
+	REQUIRE(data[0] == 1000);
+	REQUIRE(data[1] == 1010);
+	REQUIRE(data[2] == 1020);
+	REQUIRE(data[3] == 1030);
 }

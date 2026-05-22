@@ -27,7 +27,8 @@ public:
 	idx_t ScanCount(ColumnScanState &state, Vector &result, idx_t count, idx_t result_offset = 0) override;
 
 	void Filter(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
-	            SelectionVector &sel, idx_t &count, const TableFilter &filter, TableFilterState &filter_state) override;
+	            SelectionVector &sel, idx_t &count, const TableFilter &filter, TableFilterState &filter_state,
+	            bool allow_bitmap) override;
 	void Select(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
 	            SelectionVector &sel, idx_t count) override;
 

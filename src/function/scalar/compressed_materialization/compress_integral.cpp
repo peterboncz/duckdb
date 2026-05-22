@@ -1,4 +1,5 @@
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -19,26 +20,32 @@ string IntegralCompressFunctionName(const LogicalType &result_type) {
 template <class INPUT_TYPE, class RESULT_TYPE>
 struct TemplatedIntegralCompress {
 	static inline RESULT_TYPE Operation(const INPUT_TYPE &input, const INPUT_TYPE &min_val) {
-		D_ASSERT(min_val <= input);
-		return UnsafeNumericCast<RESULT_TYPE>(input - min_val);
+		(void)min_val;
+		return UnsafeNumericCast<RESULT_TYPE>(input);
 	}
 };
 
 template <class RESULT_TYPE>
 struct TemplatedIntegralCompress<hugeint_t, RESULT_TYPE> {
 	static inline RESULT_TYPE Operation(const hugeint_t &input, const hugeint_t &min_val) {
-		D_ASSERT(min_val <= input);
-		return UnsafeNumericCast<RESULT_TYPE>((input - min_val).lower);
+		(void)min_val;
+		return UnsafeNumericCast<RESULT_TYPE>(input.lower);
 	}
 };
 
 template <class RESULT_TYPE>
 struct TemplatedIntegralCompress<uhugeint_t, RESULT_TYPE> {
 	static inline RESULT_TYPE Operation(const uhugeint_t &input, const uhugeint_t &min_val) {
-		D_ASSERT(min_val <= input);
-		return UnsafeNumericCast<RESULT_TYPE>((input - min_val).lower);
+		(void)min_val;
+		return UnsafeNumericCast<RESULT_TYPE>(input.lower);
 	}
 };
+
+template <class INPUT_TYPE, class RESULT_TYPE>
+static bool IntegralCompressFitsResult(const INPUT_TYPE &value) {
+	RESULT_TYPE result;
+	return TryCast::Operation(value, result);
+}
 
 template <class INPUT_TYPE, class RESULT_TYPE>
 void IntegralCompressFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -51,31 +58,45 @@ void IntegralCompressFunction(DataChunk &args, ExpressionState &state, Vector &r
 	// FOR vector fast path: operate on narrow stored data directly
 	const SelectionVector *dict_sel = nullptr;
 	auto *for_vec = FORVector::TryGetFOR(input_vec, dict_sel);
-	if (for_vec && !dict_sel) {
+	if (for_vec) {
 		auto stored_type = FORVector::GetStoredType(*for_vec);
-		auto stored_size = GetTypeIdSize(stored_type);
-		auto result_size = GetTypeIdSize(result.GetType().InternalType());
 		auto src = FORVector::GetData(*for_vec);
+		const auto for_max = FORVector::GetMax<INPUT_TYPE>(*for_vec);
 
-		if (stored_size <= result_size && min_val >= INPUT_TYPE(0) &&
-		    static_cast<uint64_t>(min_val) <= static_cast<uint64_t>(NumericLimits<RESULT_TYPE>::Maximum())) {
-			auto result_data = FlatVector::GetDataMutable<RESULT_TYPE>(result);
-			bool handled = true;
-			FOR_SWITCH_STORED(stored_type, STORED_T, {
-				auto stored_data = reinterpret_cast<const STORED_T *>(src);
-				if (static_cast<uint64_t>(min_val) > static_cast<uint64_t>(NumericLimits<STORED_T>::Maximum())) {
-					handled = false;
+		if (IntegralCompressFitsResult<INPUT_TYPE, RESULT_TYPE>(for_max)) {
+			if (stored_type == result.GetType().InternalType()) {
+				auto stored_view = FORVector::CreateStoredView(*for_vec);
+				if (!dict_sel) {
+					result.Reference(stored_view);
 				} else {
-					auto min_narrow = static_cast<STORED_T>(min_val);
-					for (idx_t i = 0; i < count; i++) {
-						result_data[i] = UnsafeNumericCast<RESULT_TYPE>(stored_data[i] - min_narrow);
-					}
+					auto entry = make_buffer<DictionaryEntry>(std::move(stored_view));
+					result.Dictionary(std::move(entry), *dict_sel, count);
 				}
-			});
-			if (handled) {
-				FlatVector::Validity(result) = FORVector::Validity(*for_vec);
 				return;
 			}
+			auto result_data = FlatVector::GetDataMutable<RESULT_TYPE>(result);
+			FOR_SWITCH_STORED(stored_type, STORED_T, {
+				auto stored_data = reinterpret_cast<const STORED_T *>(src);
+				for (idx_t i = 0; i < count; i++) {
+					auto src_idx = dict_sel ? dict_sel->get_index(i) : i;
+					result_data[i] = UnsafeNumericCast<RESULT_TYPE>(stored_data[src_idx]);
+				}
+			});
+			if (!dict_sel) {
+				FlatVector::SetValidity(result, FORVector::Validity(*for_vec));
+			} else {
+				auto &result_validity = FlatVector::ValidityMutable(result);
+				result_validity.Reset(count);
+				auto &source_validity = FORVector::Validity(*for_vec);
+				if (source_validity.CanHaveNull()) {
+					for (idx_t i = 0; i < count; i++) {
+						if (!source_validity.RowIsValid(dict_sel->get_index(i))) {
+							result_validity.SetInvalid(i);
+						}
+					}
+				}
+			}
+			return;
 		}
 	}
 
@@ -145,49 +166,64 @@ string IntegralDecompressFunctionName(const LogicalType &result_type) {
 template <class INPUT_TYPE, class RESULT_TYPE>
 struct TemplatedIntegralDecompress {
 	static inline RESULT_TYPE Operation(const INPUT_TYPE &input, const RESULT_TYPE &min_val) {
-		return min_val + UnsafeNumericCast<RESULT_TYPE, INPUT_TYPE>(input);
+		(void)min_val;
+		return UnsafeNumericCast<RESULT_TYPE, INPUT_TYPE>(input);
 	}
 };
 
 template <class INPUT_TYPE>
 struct TemplatedIntegralDecompress<INPUT_TYPE, hugeint_t> {
 	static inline hugeint_t Operation(const INPUT_TYPE &input, const hugeint_t &min_val) {
-		return min_val + hugeint_t(0, input);
+		(void)min_val;
+		return hugeint_t(0, input);
 	}
 };
 
 template <class INPUT_TYPE>
 struct TemplatedIntegralDecompress<INPUT_TYPE, uhugeint_t> {
 	static inline uhugeint_t Operation(const INPUT_TYPE &input, const uhugeint_t &min_val) {
-		return min_val + uhugeint_t(0, input);
+		(void)min_val;
+		return uhugeint_t(0, input);
 	}
 };
 
 template <class INPUT_TYPE, class RESULT_TYPE>
 void IntegralDecompressFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	D_ASSERT(args.ColumnCount() == 3);
+	D_ASSERT(args.ColumnCount() >= 2);
 	D_ASSERT(args.data[1].GetVectorType() == VectorType::CONSTANT_VECTOR);
-	D_ASSERT(args.data[2].GetVectorType() == VectorType::CONSTANT_VECTOR);
 	const auto min_val = ConstantVector::GetData<RESULT_TYPE>(args.data[1])[0];
 	auto &input_vec = args.data[0];
 	auto count = args.size();
 
-	if (sizeof(RESULT_TYPE) > sizeof(INPUT_TYPE) && count > 1) {
-		auto input_phys = input_vec.GetType().InternalType();
+	if (args.ColumnCount() >= 3 && sizeof(RESULT_TYPE) > sizeof(INPUT_TYPE) && count > 1) {
+		D_ASSERT(args.data[2].GetVectorType() == VectorType::CONSTANT_VECTOR);
 		// Only produce FOR if input is strictly narrower than result
-		if (GetTypeIdSize(input_phys) < sizeof(RESULT_TYPE) && min_val >= RESULT_TYPE(0)) {
+		if (GetTypeIdSize(input_vec.GetType().InternalType()) < sizeof(RESULT_TYPE)) {
 			const auto max_val = ConstantVector::GetData<RESULT_TYPE>(args.data[2])[0];
 			PhysicalType stored_phys;
 			if (FORVector::TryGetStoredTypeForMax<RESULT_TYPE>(max_val, stored_phys)) {
-				input_vec.Flatten(count);
+				if (FORVector::TryReferencePayload<RESULT_TYPE>(input_vec, result, stored_phys, max_val, count)) {
+					return;
+				}
+				UnifiedVectorFormat input_data;
+				input_vec.ToUnifiedFormat(input_data);
 				FORVector::Create<RESULT_TYPE>(result, stored_phys, max_val);
-				FORVector::Validity(result) = FlatVector::Validity(input_vec);
-				auto input_data = FlatVector::GetData<INPUT_TYPE>(input_vec);
+				auto &result_validity = FORVector::Validity(result);
+				result_validity.Reset(count);
+				if (input_data.validity.CanHaveNull()) {
+					for (idx_t i = 0; i < count; i++) {
+						auto src_idx = input_data.sel->get_index(i);
+						if (!input_data.validity.RowIsValid(src_idx)) {
+							result_validity.SetInvalid(i);
+						}
+					}
+				}
+				auto input_ptr = UnifiedVectorFormat::GetData<INPUT_TYPE>(input_data);
 				FOR_SWITCH_STORED(stored_phys, STORED_T, {
 					auto result_data = reinterpret_cast<STORED_T *>(FORVector::GetData(result));
 					for (idx_t i = 0; i < count; i++) {
-						result_data[i] = UnsafeNumericCast<STORED_T>(
-						    TemplatedIntegralDecompress<INPUT_TYPE, RESULT_TYPE>::Operation(input_data[i], min_val));
+						auto src_idx = input_data.sel->get_index(i);
+						result_data[i] = UnsafeNumericCast<STORED_T>(input_ptr[src_idx]);
 					}
 				});
 				return;
@@ -250,16 +286,16 @@ scalar_function_t GetIntegralDecompressFunctionInputSwitch(const LogicalType &in
 }
 
 void CMIntegralSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-                         const ScalarFunction &function) {
-	serializer.WriteProperty(100, "arguments", function.arguments);
+                         const BoundScalarFunction &function) {
+	serializer.WriteProperty(100, "arguments", function.GetArguments());
 	serializer.WriteProperty(101, "return_type", function.GetReturnType());
 }
 
 template <scalar_function_t (*GET_FUNCTION)(const LogicalType &, const LogicalType &)>
-unique_ptr<FunctionData> CMIntegralDeserialize(Deserializer &deserializer, ScalarFunction &function) {
-	function.arguments = deserializer.ReadProperty<vector<LogicalType>>(100, "arguments");
+unique_ptr<FunctionData> CMIntegralDeserialize(Deserializer &deserializer, BoundScalarFunction &function) {
+	function.GetArguments() = deserializer.ReadProperty<vector<LogicalType>>(100, "arguments");
 	auto return_type = deserializer.ReadProperty<LogicalType>(101, "return_type");
-	function.SetFunctionCallback(GET_FUNCTION(function.arguments[0], return_type));
+	function.SetFunctionCallback(GET_FUNCTION(function.GetArguments()[0], return_type));
 	return nullptr;
 }
 
@@ -299,8 +335,9 @@ ScalarFunction CMIntegralCompressFun::GetFunction(const LogicalType &input_type,
 }
 
 ScalarFunction CMIntegralDecompressFun::GetFunction(const LogicalType &input_type, const LogicalType &result_type) {
-	ScalarFunction result(IntegralDecompressFunctionName(result_type), {input_type, result_type, result_type}, result_type,
-	                      GetIntegralDecompressFunctionInputSwitch(input_type, result_type), CMUtils::Bind);
+	ScalarFunction result(IntegralDecompressFunctionName(result_type), {input_type, result_type, result_type},
+	                      result_type, GetIntegralDecompressFunctionInputSwitch(input_type, result_type),
+	                      CMUtils::Bind);
 	result.SetSerializeCallback(CMIntegralSerialize);
 	result.SetDeserializeCallback(CMIntegralDeserialize<GetIntegralDecompressFunctionInputSwitch>);
 	return result;
