@@ -447,10 +447,8 @@ void Vector::Flatten(idx_t count) const {
 
 void Vector::Flatten() const {
 	if (buffer->GetVectorType() == VectorType::FOR_VECTOR) {
-		// the narrow payload sits in a full-stride allocation: widen it where it is, so every vector
-		// referencing this buffer sees flat data
-		ForVector::WidenInPlace(GetType(), *buffer);
-		return;
+		ForVector::WidenInPlace(GetType(), *buffer); // pre-allocated wide
+		return;                                      // referencing this buffer sees flat data
 	}
 	auto new_buffer = Buffer().Flatten(GetType());
 	if (new_buffer) {
@@ -898,8 +896,7 @@ void Vector::SetVectorType(VectorType new_vector_type) {
 	if (new_vector_type != VectorType::FLAT_VECTOR && new_vector_type != VectorType::CONSTANT_VECTOR) {
 		throw InternalException("SetVectorType can only be used with FLAT / CONSTANT vectors");
 	}
-	// dropping the FOR flag has to widen: otherwise the payload stays narrow but reads at the logical stride
-	ForVector::Widen(*this);
+	ForVector::Widen(*this); // dropping the FOR flag has to widen
 	if (buffer) {
 		// FIXME: should we allow vectors without a buffer?
 		BufferMutable().SetVectorType(new_vector_type);

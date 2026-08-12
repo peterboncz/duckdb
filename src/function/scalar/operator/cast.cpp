@@ -74,13 +74,11 @@ void CastFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &source = args.data[0];
 	idx_t count = args.size();
 
-	// hook 5: an integer downcast onto the payload's own width is a reinterpretation, handed over uncopied;
-	// the mirror upcast (decompression above a join) keeps the values narrow under a FOR flag
+	// FOR will makes a downcast to its narrow representation a noop; an upcast creates a new FOR vector
 	if (ForVector::TryRetype(source, result, count) || ForVector::TryPromote(source, result, count)) {
 		FlatVector::SetSize(result, count_t(count));
-		return;
+		return; // -- FOR so absorbs Compressed Materialization cost
 	}
-
 	// Constant inputs are handled by the generic function executor (cardinality is reduced to 1). NULL handling is
 	// marked SPECIAL_HANDLING so that constant NULL inputs still reach the cast (required for e.g. UNION targets).
 	string error_message;

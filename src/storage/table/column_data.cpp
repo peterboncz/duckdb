@@ -212,13 +212,9 @@ void ColumnData::BeginScanVectorInternal(ColumnScanState &state) {
 
 idx_t ColumnData::ScanVector(ColumnScanState &state, Vector &result, idx_t remaining, ScanVectorType scan_type,
                              idx_t base_result_offset) {
-	// A payload left in a reused result has to go before a scan writes at the logical stride. Widening rather than
-	// dropping the flag is required: a scan does not always cover the whole published payload. The validity column
-	// scans into the same result vector but only touches the mask, so it must not undo what the data scan published.
-	if (type.id() != LogicalTypeId::VALIDITY) {
-		// this scan is about to rewrite the payload, so widening it first is wasted work
+	if (type.id() != LogicalTypeId::VALIDITY) { // validity only touches the mask, do not undo scan data work
 		if (base_result_offset == 0) {
-			ForVector::Discard(result);
+			ForVector::Discard(result); // scan is about to rewrite the payload, so widening is wasted work
 		} else {
 			ForVector::Widen(result);
 		}

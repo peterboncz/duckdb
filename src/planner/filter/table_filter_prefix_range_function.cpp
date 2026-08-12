@@ -165,20 +165,12 @@ public:
 				return LookupKeysStored<T, CONVERTER>(reinterpret_cast<const decltype(s) *>(data), sel, result_sel,
 				                                      count);
 			};
-			switch (GetTypeIdSize(ForVector::StoredType(keys))) {
-			case 1:
-				found = probe(uint8_t(0));
-				return true;
-			case 2:
-				found = probe(uint16_t(0));
-				return true;
-			case 4:
-				found = probe(uint32_t(0));
-				return true;
-			default:
-				found = probe(uint64_t(0));
-				return true;
-			}
+			const auto width = GetTypeIdSize(ForVector::StoredType(keys));
+			found = width == 1   ? probe(uint8_t(0))
+			        : width == 2 ? probe(uint16_t(0))
+			        : width == 4 ? probe(uint32_t(0))
+			                     : probe(uint64_t(0));
+			return true;
 		}
 		return false;
 	}

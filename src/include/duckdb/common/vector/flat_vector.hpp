@@ -66,10 +66,9 @@ protected:
 	idx_t type_size;
 	idx_t capacity;
 	AllocatedData allocated_data;
-	//! Reused targets for the FOR gather-widen, so a sparse flatten costs no allocation per vector.
-	//! Two slots: one expression can hold slices of this buffer through two inputs at once.
+	//! Reusable buffers for the FOR gather-widen, so a sparse flatten costs no allocation per vector.
 	mutable buffer_ptr<StandardVectorBuffer> widen_slots[2];
-	mutable uint8_t widen_slot = 0;
+	mutable uint8_t widen_slot = 0; // Two slots: an expression can hold slices of this buffer thru 2 inputs at once
 };
 
 template <class T>
@@ -78,11 +77,9 @@ template <class T>
 struct VectorScatterWriter;
 
 struct FlatVector {
-	//! A typed accessor only checks the logical type, so a FOR payload would silently be read at the wrong stride.
-	//! Widening here is what makes every FOR-unaware kernel correct; the hooks read via GetDataUnsafe instead.
 	static void WidenFor(const Vector &vector) {
 		if (vector.GetVectorType() == VectorType::FOR_VECTOR) {
-			vector.Flatten();
+			vector.Flatten(); //! Widening makes every FOR-unaware kernel correct
 		}
 	}
 	static void VerifyFlatVector(const Vector &vector) {

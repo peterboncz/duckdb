@@ -119,11 +119,8 @@ buffer_ptr<VectorBuffer> StandardVectorBuffer::SliceInternal(const LogicalType &
 		// to avoid creating a DictionaryBuffer with a null selection vector.
 		return SliceInternal(type, idx_t(0), count);
 	}
-	// Sparse selection over a narrow payload: gather-widen the survivors into a reused slot instead of building a
-	// dictionary over the whole narrow child - every consumer of that dictionary would widen the payload anyway.
-	// The gather-vs-dense call is made on the stored width, since the dense alternative reads the narrow payload.
-	if (vector_type == VectorType::FOR_VECTOR &&
-	    !DenseAutoVecPaysOff(count, Size(), GetTypeIdSize(for_stored_type))) {
+	// Sparse selection on narrow payload: gather-widen survivors iso building a dictionary on the whole child
+	if (vector_type == VectorType::FOR_VECTOR && !DenseAutoVecPaysOff(count, Size(), GetTypeIdSize(for_stored_type))) {
 		for_cooldown = 0; // the gather exploited the narrow payload: keep the scan producing FOR
 		return FlattenSliceInternal(type, sel, count);
 	}
@@ -207,6 +204,7 @@ buffer_ptr<VectorBuffer> StandardVectorBuffer::Flatten(const LogicalType &type) 
 
 buffer_ptr<VectorBuffer> StandardVectorBuffer::FlattenSliceInternal(const LogicalType &type, const SelectionVector &sel,
                                                                     idx_t count) const {
+	// allocate the new buffer
 	auto allocated_count = MaxValue<idx_t>(STANDARD_VECTOR_SIZE, count);
 	if (vector_type == VectorType::FOR_VECTOR && count <= STANDARD_VECTOR_SIZE) {
 		// gather straight out of the narrow payload: only the selected rows get widened. The gather runs once per
@@ -228,7 +226,6 @@ buffer_ptr<VectorBuffer> StandardVectorBuffer::FlattenSliceInternal(const Logica
 			return slot;
 		}
 	}
-	// allocate the new buffer
 	auto target_byte_count = allocated_count * type_size;
 	auto stored_allocator = GetAllocator();
 	auto &allocator = stored_allocator ? *stored_allocator : Allocator::DefaultAllocator();
@@ -304,8 +301,8 @@ void StandardVectorBuffer::CopyInternal(const Vector &source, const SelectionVec
 	if (source.GetVectorType() == VectorType::FOR_VECTOR) {
 		// gather-widen only the copied values: the narrow source stays narrow
 		auto &src_buf = *source.GetBufferRef();
-		const auto target_pt = type_size == 2 ? PhysicalType::UINT16
-		                                      : (type_size == 4 ? PhysicalType::UINT32 : PhysicalType::UINT64);
+		const auto target_pt =
+		    type_size == 2 ? PhysicalType::UINT16 : (type_size == 4 ? PhysicalType::UINT32 : PhysicalType::UINT64);
 		ForVector::WidenGather(src_buf.GetData(), src_buf.for_stored_type, data_ptr + target_offset * type_size,
 		                       target_pt, source_sel, copy_count, source_offset);
 		return;

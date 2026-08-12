@@ -36,8 +36,8 @@ enum class VectorBufferType : uint8_t {
 	DICTIONARY_BUFFER, // VectorType::DICTIONARY    - Any             - Holds SelectionVector and dict child vector
 	FSST_BUFFER,       // VectorType::FSST          - String          - Holds string_t array, StringHeap and FSST table
 	SHREDDED_BUFFER,   // VectorType::SHREDDED      - Variant         - Holds shredded variant
-	SEQUENCE_BUFFER // VectorType::SEQUENCE      - Any             - Holds linear numeric sequence (start, increment)
-	                // VectorType::FOR has no buffer of its own: it is a flag on a STANDARD_BUFFER
+	SEQUENCE_BUFFER    // VectorType::SEQUENCE      - Any             - Holds linear numeric sequence (start, increment)
+	                   // VectorType::FOR has no buffer of its own: it is a flag on a STANDARD_BUFFER
 };
 
 enum class VectorAppendMode { ALLOW_RESIZE, ERROR_ON_NO_SPACE };
@@ -150,21 +150,14 @@ public:
 		return buffer_type;
 	}
 
-	//! Inline FOR state: only meaningful while the vector type is FOR_VECTOR
+	//! Inline FOR state: only used for FOR_VECTOR (thin representations of a wider integer columns)
 	PhysicalType for_stored_type = PhysicalType::INVALID;
-	uint64_t for_max = 0;
-	//! Rows of narrow payload. Kept separately from the vector size, which callers own and read.
-	idx_t for_count = 0;
-	//! True when a VectorCache owns this buffer, so the payload has full stride and can be widened in place
-	bool cache_owned = false;
-	//! Vectors to skip before producing FOR again. Zero means produce it. A full widen (nothing used the narrow
-	//! payload) sets a cooldown and an exploit site clears it, so the cost of guessing wrong is bounded to the
-	//! cooldown rather than the rest of the query.
-	uint16_t for_cooldown = 0;
-	//! Whether any consumer used this payload narrow since it was produced. A trailing widen (e.g. an
-	//! aggregate sink) after an exploit is the normal end of a useful FOR vector, not a wasted one, so
-	//! only a widen of a never-exploited payload starts the cooldown.
-	bool for_exploited = false;
+	uint64_t for_max = 0;     // the maximum value in this FOR-vector
+	idx_t for_count = 0;      // rows of narrow payload. Kept separate of vector size, which callers own and read.
+	bool cache_owned = false; // true if VectorCache owns buffer: then payload has full stride & can widen in place
+	//! Mechanism to avoid overhead by needless FOR: full widen-inplace sets it, FOR optimizations clear it
+	uint16_t for_cooldown = 0;  // vectors to skip before producing FOR again. Zero means produce it.
+	bool for_exploited = false; // whether a FOR optimized consumer used it. Prevents cooldown from being set.
 
 public:
 	//! Returns the actual size to reserve (a power-of-two)

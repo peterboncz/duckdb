@@ -180,8 +180,7 @@ buffer_ptr<VectorBuffer> VectorBuffer::FlattenSliceInternal(const LogicalType &t
 
 buffer_ptr<VectorBuffer> VectorBuffer::Slice(const LogicalType &type, idx_t offset, idx_t end) {
 	if (vector_type == VectorType::FOR_VECTOR) {
-		// an offset slice re-points into the payload at the logical stride, so widen first
-		ForVector::WidenInPlace(type, *this);
+		ForVector::WidenInPlace(type, *this); // offset slices points at the logical stride, must widen
 	}
 	if (vector_type == VectorType::CONSTANT_VECTOR) {
 		// constant vectors do not need to get sliced - but we do need to update the count
@@ -198,8 +197,7 @@ buffer_ptr<VectorBuffer> VectorBuffer::Slice(const LogicalType &type, idx_t offs
 
 buffer_ptr<VectorBuffer> VectorBuffer::Slice(const LogicalType &type, const SelectionVector &sel, idx_t count) {
 	if (vector_type == VectorType::FOR_VECTOR && !sel.IsSet()) {
-		// only a real selection keeps FOR alive: it wraps the narrow payload as a dictionary child
-		ForVector::WidenInPlace(type, *this);
+		ForVector::WidenInPlace(type, *this); // but selection-slices do keep FOR alive
 	}
 	if (vector_type == VectorType::CONSTANT_VECTOR) {
 		// constant vectors do not need to get sliced - but we do need to update the count

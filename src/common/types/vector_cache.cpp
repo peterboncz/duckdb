@@ -56,8 +56,7 @@ public:
 		buffer->ClearAuxiliaryData();
 		result.SetBuffer(buffer_ptr<VectorBuffer>(buffer));
 		result.BufferMutable().ResetCapacity(capacity);
-		// the reset drops the payload: size goes to 0 below and the next producer overwrites the bytes, so the
-		// flag can go without widening. Widening here was ~38% of all widens on a filtered scan.
+		// reset drops the payload: size goes to 0; the next producer overwrites its bytes, so no widening needed
 		result.BufferMutable().for_stored_type = PhysicalType::INVALID;
 		result.BufferMutable().SetVectorTypeOnly(VectorType::FLAT_VECTOR);
 		result.BufferMutable().cache_owned = false;
@@ -134,10 +133,8 @@ void VectorCache::ResetFromCache(Vector &result) const {
 	if (!cache_entry) {
 		return;
 	}
-	cache_entry->ResetFromCache(result);
-	// only the top-level vector may carry a FOR payload: nested children are read through parents that would have
-	// to recurse into them, so the recursive reset above deliberately leaves cache_owned unset on children
-	result.BufferMutable().cache_owned = true;
+	cache_entry->ResetFromCache(result);       // leaves cache_owned unset on the children
+	result.BufferMutable().cache_owned = true; // only the top-level vector may carry a FOR payload
 }
 
 const LogicalType &VectorCache::GetType() const {

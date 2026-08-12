@@ -95,12 +95,10 @@ DUCKDB_AUTOVEC_TARGET inline bool SelectComparisonFromChunk(ExecuteFunctionState
 	}
 	const auto &info = fstate.cmp_info;
 	auto &col_in = chunk.data[info.ref->Index()]; // dense compare reads the flat input directly
-	// A sliced FOR input compares densely on the dictionary child: the shared slice is applied to the
-	// result bitmap afterwards, so the narrow payload never widens just to be filtered.
+	// A sliced FOR input compares densely on the dictionary child: narrow payload never widens just to be filtered.
 	const SelectionVector *slice_sel = nullptr;
 	reference<Vector> lref(col_in);
-	if (col_in.GetVectorType() == VectorType::DICTIONARY_VECTOR &&
-	    ForVector::IsFor(DictionaryVector::Child(col_in))) {
+	if (col_in.GetVectorType() == VectorType::DICTIONARY_VECTOR && ForVector::IsFor(DictionaryVector::Child(col_in))) {
 		if (info.ref2) {
 			auto &right = chunk.data[info.ref2->Index()];
 			if (right.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
@@ -116,13 +114,10 @@ DUCKDB_AUTOVEC_TARGET inline bool SelectComparisonFromChunk(ExecuteFunctionState
 		auto &right = chunk.data[info.ref2->Index()];
 		return slice_sel ? DictionaryVector::Child(right) : right;
 	};
-	// A narrow payload is worth comparing however few rows are selected: the classic path widens the whole payload
-	// to read it, so the dense narrow compare is cheaper even at low selectivity. Only non-FOR inputs bail here.
-	if (!ForVector::IsFor(col) && !AutoVecCountPaysOff(count)) {
-		return false;
+	if (!ForVector::IsFor(col) && !AutoVecCountPaysOff(count)) { // A FOR payload is worth comparing always
+		return false; // Only non-FOR inputs bails for autovec if there are too few selected tuples anymore
 	}
 	auto pt = col.GetType().InternalType();
-	// hook 2: a narrow payload compares in stored space, where the same kernels move fewer bytes per lane
 	uint64_t stored_constant = 0;
 	bool stored = false;
 	bool stored_pair = false;
@@ -169,10 +164,8 @@ DUCKDB_AUTOVEC_TARGET inline bool SelectComparisonFromChunk(ExecuteFunctionState
 	if (span > STANDARD_VECTOR_SIZE) {                  // bitmap scratch is vector-sized
 		return false;
 	}
-	// A narrow payload stays on the dense path however selective the input is: bailing hands it to the generic
-	// path, which widens the whole payload to compare it, so the narrow compare over the full span is cheaper.
 	if (have_sel && !stored && !stored_pair && !DenseAutoVecPaysOff(count, span, GetTypeIdSize(pt))) {
-		return false;
+		return false; // FOR does not bail here (generic would widen the column which is slower)
 	}
 	SelectionResult &t = bitmap_sel ? *bitmap_sel : fstate.tmp_sel1; // true-side bitmap
 	auto t_bm = t.PrepareBitmap(span);

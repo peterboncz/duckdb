@@ -32,8 +32,7 @@ bool ForVector::TryRetype(Vector &source, Vector &result, idx_t count) {
 	auto buffer = make_buffer<StandardVectorBuffer>(source.BufferMutable().GetData(), count_t(count), target_size);
 	buffer->GetValidityMask().Initialize(source.Buffer().GetValidityMask());
 	buffer->AddAuxiliaryData(make_uniq<VectorBufferHolder>(source.GetBufferRef()));
-	// the view aliases the payload, so the source must lose its in-place widen permission: a later flatten has to
-	// copy out rather than rewrite the bytes this view is showing
+	// the view aliases the payload, so the source must lose its in-place widen permission
 	source.BufferMutable().cache_owned = false;
 	MarkExploited(source); // the retype used the narrow payload: keep the scan producing FOR for this column
 	result.SetBuffer(std::move(buffer));
@@ -44,8 +43,7 @@ bool ForVector::TryRetype(Vector &source, Vector &result, idx_t count) {
 template <class T>
 DUCKDB_AUTOVEC_TARGET static bool PromoteLoop(const T *DUCKDB_BITPACKING_RESTRICT src,
                                               T *DUCKDB_BITPACKING_RESTRICT dst, idx_t count, uint64_t &max_out) {
-	T lo = 0;
-	T hi = 0;
+	T lo = 0, hi = 0;
 	DUCKDB_UNROLL_LOOP
 	for (idx_t i = 0; i < count; i++) {
 		dst[i] = src[i];
@@ -77,22 +75,20 @@ bool ForVector::TryPromote(Vector &source, Vector &result, idx_t cnt) {
 		return false; // the real cast overwrites the partial narrow copy
 	}
 	FlatVector::SetValidity(result, source.Buffer().GetValidityMask());
-	Create(result, src_size == 1 ? PhysicalType::UINT8 : (src_size == 2 ? PhysicalType::UINT16 : PhysicalType::UINT32),
-	       lim, cnt);
+	auto type = src_size == 1 ? PhysicalType::UINT8 : (src_size == 2 ? PhysicalType::UINT16 : PhysicalType::UINT32);
+	Create(result, type, lim, cnt);
 	return true;
 }
 
-//! A constant above the payload's ceiling makes every comparison uniform, and replacing it with for_max + 1 gives
-//! that same answer through the ordinary kernel: no value can equal or exceed it, and every value is below it.
-//! So the comparison stays a narrow one instead of widening the payload to reach a foregone conclusion.
+//! A constant above the payload's ceiling makes every comparison uniform
 static bool ClampStoredConstant(const Vector &vector, uint64_t &value) {
 	const auto max_stored = ForVector::MaxStored(vector);
 	if (value <= max_stored) {
 		return true;
 	}
 	const auto stored_size = GetTypeIdSize(ForVector::StoredType(vector));
-	const uint64_t stored_max = stored_size == 8 ? NumericLimits<uint64_t>::Maximum()
-	                                            : ((uint64_t(1) << (stored_size * 8)) - 1);
+	const uint64_t stored_max =
+	    stored_size == 8 ? NumericLimits<uint64_t>::Maximum() : ((uint64_t(1) << (stored_size * 8)) - 1);
 	if (max_stored >= stored_max) {
 		return false; // no headroom for the sentinel
 	}
@@ -147,26 +143,15 @@ DUCKDB_AUTOVEC_TARGET static void WidenInPlaceLoop(data_ptr_t data, idx_t count)
 //! Route a (stored, target) width pair to fun(SRC{}, DST{})
 template <class FUNC>
 static void DispatchWiden(PhysicalType stored, PhysicalType target, FUNC &&fun) {
+	const auto src = GetTypeIdSize(stored);
 	auto with_src = [&](auto dst) {
-		switch (GetTypeIdSize(stored)) {
-		case 1:
-			return fun(uint8_t(0), dst);
-		case 2:
-			return fun(uint16_t(0), dst);
-		case 4:
-			return fun(uint32_t(0), dst);
-		default:
-			return fun(uint64_t(0), dst);
-		}
+		return src == 1   ? fun(uint8_t(0), dst)
+		       : src == 2 ? fun(uint16_t(0), dst)
+		       : src == 4 ? fun(uint32_t(0), dst)
+		                  : fun(uint64_t(0), dst);
 	};
-	switch (GetTypeIdSize(target)) {
-	case 2:
-		return with_src(uint16_t(0));
-	case 4:
-		return with_src(uint32_t(0));
-	default:
-		return with_src(uint64_t(0));
-	}
+	const auto tgt = GetTypeIdSize(target);
+	return tgt == 2 ? with_src(uint16_t(0)) : tgt == 4 ? with_src(uint32_t(0)) : with_src(uint64_t(0));
 }
 
 void ForVector::WidenInPlace(data_ptr_t data, PhysicalType stored, PhysicalType target_type, idx_t count) {

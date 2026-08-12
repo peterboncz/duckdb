@@ -100,8 +100,8 @@ DUCKDB_AUTOVEC_TARGET static void ForArithLoop(const L *DUCKDB_BITPACKING_RESTRI
                                                RES *DUCKDB_BITPACKING_RESTRICT res, idx_t count) {
 	DUCKDB_UNROLL_LOOP
 	for (idx_t i = 0; i < count; i++) {
-		res[i] = OP::template Operation<RES, RES, RES>(static_cast<RES>(lhs[LC ? 0 : i]),
-		                                               static_cast<RES>(rhs[RC ? 0 : i]));
+		res[i] =
+		    OP::template Operation<RES, RES, RES>(static_cast<RES>(lhs[LC ? 0 : i]), static_cast<RES>(rhs[RC ? 0 : i]));
 	}
 }
 
@@ -154,14 +154,7 @@ static bool ForArithBound(const ForArithOperand &l, const ForArithOperand &r, ui
 
 template <class FUNC>
 static void DispatchForArithWidth(idx_t width, FUNC &&fun) {
-	switch (width) {
-	case 1:
-		return fun(uint8_t(0));
-	case 2:
-		return fun(uint16_t(0));
-	default:
-		return fun(uint32_t(0));
-	}
+	return width == 1 ? fun(uint8_t(0)) : width == 2 ? fun(uint16_t(0)) : fun(uint32_t(0));
 }
 
 template <class OP, class RES>
@@ -201,10 +194,7 @@ static bool TryForArithmetic(Vector &left, Vector &right, Vector &result, idx_t 
 	if (!buffer || buffer->Capacity() < count) {
 		return false;
 	}
-	// a narrow result needs a proven bound and a buffer we may re-widen in place; the wide result is
-	// always safe, since the stats rewrite proved the full-width operation cannot overflow. No keepalive
-	// token here: the narrow result is cheaper to write than the wide one, so there is nothing to regret.
-	uint64_t bound;
+	uint64_t bound; // a narrow result needs a proven bound and a buffer we may re-widen in place
 	const bool bounded = ForArithBound<OP>(l, r, bound) && buffer->cache_owned;
 	const bool narrow = bounded && bound <= NumericLimits<uint32_t>::Maximum();
 	ForVector::Discard(result); // the payload is rewritten wholesale below
@@ -225,9 +215,7 @@ static bool TryForArithmetic(Vector &left, Vector &right, Vector &result, idx_t 
 		});
 	} else {
 		DispatchForArith<OP, int64_t>(l, r, reinterpret_cast<int64_t *>(data), count);
-		if (bounded) {
-			// a full-width payload with a known max: widening is a no-op, and the max lets a sum skip
-			// its per-value overflow check
+		if (bounded) { // a full-width payload with a known max: widening is a no-op
 			ForVector::Create(result, PhysicalType::UINT64, bound, count);
 		}
 	}
@@ -237,15 +225,14 @@ static bool TryForArithmetic(Vector &left, Vector &right, Vector &result, idx_t 
 	if (r.is_for) {
 		ForVector::MarkExploited(right);
 	}
-	return true;
+	return true; // no keepalive token here: the narrow result is cheaper to write, so there is nothing to regret
 }
 
 template <class OP>
 static void ForAwareFunction(DataChunk &input, ExpressionState &state, Vector &result) {
-	if (TryForArithmetic<OP>(input.data[0], input.data[1], result, input.size())) {
-		return;
+	if (!TryForArithmetic<OP>(input.data[0], input.data[1], result, input.size())) {
+		ScalarFunction::BinaryFunction<int64_t, int64_t, int64_t, OP>(input, state, result);
 	}
-	ScalarFunction::BinaryFunction<int64_t, int64_t, int64_t, OP>(input, state, result);
 }
 
 template <class T>
@@ -341,18 +328,15 @@ struct SubtractPropagateStatistics {
 struct DecimalArithmeticBindData : public FunctionData {
 	DecimalArithmeticBindData() : check_overflow(false) {
 	}
-
 	unique_ptr<FunctionData> Copy() const override {
 		auto res = make_uniq<DecimalArithmeticBindData>();
 		res->check_overflow = check_overflow;
 		return std::move(res);
 	}
-
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<DecimalArithmeticBindData>();
 		return other.check_overflow == check_overflow;
 	}
-
 	bool check_overflow;
 };
 

@@ -138,8 +138,7 @@ void ColumnSegment::Scan(ColumnScanState &state, idx_t scan_count, Vector &resul
 		Scan(state, scan_count, result);
 	} else {
 		if (result_offset > 0) {
-			// an earlier segment published a narrow payload: widen it before appending at the logical stride
-			ForVector::Widen(result);
+			ForVector::Widen(result); // prev segment emitted narrow payload: must widen it now
 		}
 		D_ASSERT(result.GetVectorType() == VectorType::FLAT_VECTOR);
 		ScanPartial(state, scan_count, result, result_offset);
@@ -496,11 +495,9 @@ static idx_t ExecuteExpressionFilterSelection(SelectionResult &sel, Vector &vect
 	chunk.SetChildCardinality(scan_count);
 	const bool nested = vector.GetType().IsNested(); // nested evaluation needs explicit indices
 	const bool identity_all = !sel.IsSet() && approved_tuple_count == scan_count;
-	// FOR payloads stay dense regardless of selectivity: every sparse alternative widens the whole payload anyway,
-	// so the narrow dense compare is the cheapest evaluation even for a handful of surviving rows
 	const bool for_payload = vector.GetVectorType() == VectorType::FOR_VECTOR;
 	const bool dense_pays = // the dense path rescans the whole vector, so it only pays while enough rows still survive;
-	    identity_all ||
+	    identity_all ||     // in case of FOR, dense pays off as we want to avoid widen then as well
 	    (sel.IsSet() && (for_payload || DenseAutoVecPaysOff(approved_tuple_count, scan_count,
 	                                                        GetTypeIdSize(vector.GetType().InternalType()))));
 	// small counts skip the bitmap path without clearing bitmap_capable for later chunks

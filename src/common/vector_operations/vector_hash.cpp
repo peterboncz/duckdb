@@ -297,10 +297,7 @@ void ArrayLoopHash(const Vector &input, Vector &hashes, const SelectionVector *r
 	}
 }
 
-//! Hash a narrow payload with the existing kernel. Hash() funnels every integer width through
-//! MurmurHash64 after a zero-extending cast, so for the non-negative values below 2^32 that a FOR payload holds,
-//! Hash<uint8/16/32> and Hash<the logical type> are the same value. This is a re-dispatch, not a different
-//! computation - and it keeps the payload narrow for a downstream retype instead of widening it here.
+//! Hash a narrow payload directly: Hash() funnels every integer width thru MurmurHash64 after 0-extending cast
 template <bool HAS_RSEL>
 bool TryHashFor(const Vector &input, Vector &result, const SelectionVector *rsel, idx_t count) {
 	const Vector *payload = &input;
@@ -341,9 +338,7 @@ bool TryHashFor(const Vector &input, Vector &result, const SelectionVector *rsel
 		hash_at(uint64_t(0));
 		break;
 	}
-	// no exploit mark: a hash reads the payload once and saves little, and a join key hashed narrow is
-	// usually widened right after for the row match - the widen's cooldown must stay in charge
-	return true;
+	return true; // hashing doesn't count as FOR success (it's just as fast) -- but at least we don't widen
 }
 
 template <bool HAS_RSEL>

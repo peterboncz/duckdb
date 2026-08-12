@@ -12,17 +12,16 @@
 
 namespace duckdb {
 
-//! A FOR vector holds absolute values in a narrower physical type than its logical type: the frame of reference is
-//! folded into the payload by the producer, so widening is a pure cast and no consumer reasons about a frame.
-//! The state lives on the vector's own cache-owned buffer, so the chunk reset un-FORs it and Flatten widens in place.
+//! A FOR vector holds absolute values in a narrower physical type than its logical type.
+//! It uses base=0, so the frame of reference on-disk is folded into it -- base 0 is common and faster
+//! Its state lives on the vector's own cache-owned buffer, so the chunk reset un-FORs it and Flatten widens in place.
+//! FOR has a keepalive/token/cooldown anti-overhead mechanism so FOR producers stop emitting if there is no benefit
 struct ForVector {
 	static bool IsFor(const Vector &vector) {
 		return vector.GetVectorType() == VectorType::FOR_VECTOR;
 	}
 	//! Mark a flat vector as FOR: its buffer already holds the narrow payload for the first count rows
 	static void Create(Vector &vector, PhysicalType stored_type, uint64_t max_stored, idx_t count);
-	//! A producer about to rewrite the payload drops the flag rather than widening it: it sets the size to what it
-	//! writes, so no reader can see a stale row. This is scan bookkeeping, so it must not spend the token.
 	static void Discard(Vector &vector) {
 		if (!IsFor(vector)) {
 			return;
@@ -31,29 +30,25 @@ struct ForVector {
 		buffer.SetVectorTypeOnly(VectorType::FLAT_VECTOR);
 		buffer.for_stored_type = PhysicalType::INVALID;
 	}
-	//! Safety net for FOR-unaware code: widen back to the logical width. Free - the payload is widened in place.
 	static void Widen(const Vector &vector) {
 		if (IsFor(vector)) {
-			vector.Flatten();
+			vector.Flatten(); //! Safety net for FOR-unaware code: widen back to the logical width.
 		}
 	}
 	static PhysicalType StoredType(const Vector &vector) {
 		return vector.GetBufferRef()->for_stored_type;
 	}
-	//! Largest value the payload holds, so a consumer can prove a computation cannot overflow
 	static uint64_t MaxStored(const Vector &vector) {
-		return vector.GetBufferRef()->for_max;
+		return vector.GetBufferRef()->for_max; //! So consumers can prove a computation cannot overflow
 	}
-	//! Vectors to sit out after a wasted widen. One in COOLDOWN is a probe, so a column whose consumers start
-	//! using the narrow payload recovers instead of staying off for the rest of the query.
-	static constexpr uint16_t COOLDOWN = 64;
-	//! True when the producer should emit FOR. Counts down a cooldown as a side effect.
-	static bool TokenSet(const Vector &vector) {
+	//! If a FOR vector is emitted but in the plan never gets exploited and needs to widen, we lose perf
+	static constexpr uint16_t COOLDOWN = 64;     // Vectors to let pass before attempting FOR emission
+	static bool TokenSet(const Vector &vector) { //! True when the producer should emit FOR.
 		auto &cooldown = vector.GetBufferRef()->for_cooldown;
 		if (cooldown == 0) {
 			return true;
 		}
-		cooldown--;
+		cooldown--; // Counts down the cooldown. Eventually we will try again
 		return false;
 	}
 	static void MarkExploited(const Vector &vector) {
@@ -61,13 +56,11 @@ struct ForVector {
 		buffer.for_cooldown = 0;
 		buffer.for_exploited = true;
 	}
-	//! Hand a narrow payload straight to an integer downcast of the same width, with no copy. False when the cast
-	//! is not a pure reinterpretation of the payload, so the caller must run the real cast. The downcast itself
-	//! exploited the narrow payload, so it refills the source's keepalive.
+	//! Hand a narrow payload straight to an integer downcast of the same width, with no copy (refills keepaline).
+	//! False when the cast //! is not a pure reinterpretation of the payload, so the caller must run the real cast.
 	static bool TryRetype(Vector &source, Vector &result, idx_t count);
-	//! An integer upcast (decompression above a join) keeps the values narrow: the result becomes a FOR vector over
-	//! a narrow copy of the input instead of a widened one. Producing this only pays if a later consumer runs
-	//! narrow, so unlike the downcast it is gated on the result's keepalive token.
+	//! An integer upcast (decompression above a join) keeps the values narrow: the result becomes a FOR vector.
+	//! This only pays if a later consumer profits, so unlike the downcast is gated on the result's keepalive token.
 	static bool TryPromote(Vector &source, Vector &result, idx_t count);
 	//! Rewrite a comparison constant into the stored space. False when it falls outside the payload's range:
 	//! the comparison is then uniform, which the normal path handles just as well.
