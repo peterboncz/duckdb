@@ -77,7 +77,7 @@ struct ForVector {
 	//! Gather-widen only the selected values into a target of the logical width. For a selective filter this
 	//! touches the survivors instead of the whole vector, which is the whole point of keeping the payload narrow.
 	static void WidenGather(const_data_ptr_t src, PhysicalType stored, data_ptr_t target, PhysicalType target_type,
-	                        const SelectionVector &sel, idx_t count);
+	                        const SelectionVector &sel, idx_t count, idx_t sel_offset = 0);
 	//! Widen a narrow payload where it lies. Always in place: a producer abandoning FOR part-way through a vector
 	//! has its source and target in the same bytes, so this must never be a forward copy.
 	static void WidenInPlace(data_ptr_t data, PhysicalType stored, PhysicalType target_type, idx_t count);

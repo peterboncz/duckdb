@@ -327,7 +327,7 @@ void VectorBuffer::Copy(const Vector &source_p, const SelectionVector &source_se
 			finished = true;
 			break;
 		case VectorType::FOR_VECTOR:
-			source.Flatten(); // in-place widen: the next iteration sees a flat source
+			finished = true; // CopyInternal gather-widens only the copied values: the source stays narrow
 			break;
 		default: {
 			// for exotic types we flatten followed by copying
@@ -344,7 +344,8 @@ void VectorBuffer::Copy(const Vector &source_p, const SelectionVector &source_se
 	auto &source = source_ref.get();
 	auto &sel = sel_ref.get();
 	auto source_type = source_ref.get().GetVectorType();
-	D_ASSERT(source_type == VectorType::CONSTANT_VECTOR || source_type == VectorType::FLAT_VECTOR);
+	D_ASSERT(source_type == VectorType::CONSTANT_VECTOR || source_type == VectorType::FLAT_VECTOR ||
+	         source_type == VectorType::FOR_VECTOR);
 	auto &validity = GetValidityMask();
 	if (source_type == VectorType::CONSTANT_VECTOR) {
 		const bool valid = !ConstantVector::IsNull(source);
@@ -352,7 +353,7 @@ void VectorBuffer::Copy(const Vector &source_p, const SelectionVector &source_se
 			validity.Set(target_offset + i, valid);
 		}
 	} else {
-		auto &smask = FlatVector::Validity(source);
+		auto &smask = source.Buffer().GetValidityMask();
 		validity.CopySel(smask, sel, source_offset, target_offset, copy_count);
 	}
 

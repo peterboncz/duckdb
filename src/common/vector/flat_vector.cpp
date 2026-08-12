@@ -301,6 +301,15 @@ void CopyVectorBuffer(data_ptr_t target_data, const_data_ptr_t source_data, cons
 
 void StandardVectorBuffer::CopyInternal(const Vector &source, const SelectionVector &source_sel, idx_t source_count,
                                         idx_t source_offset, idx_t target_offset, idx_t copy_count) {
+	if (source.GetVectorType() == VectorType::FOR_VECTOR) {
+		// gather-widen only the copied values: the narrow source stays narrow
+		auto &src_buf = *source.GetBufferRef();
+		const auto target_pt = type_size == 2 ? PhysicalType::UINT16
+		                                      : (type_size == 4 ? PhysicalType::UINT32 : PhysicalType::UINT64);
+		ForVector::WidenGather(src_buf.GetData(), src_buf.for_stored_type, data_ptr + target_offset * type_size,
+		                       target_pt, source_sel, copy_count, source_offset);
+		return;
+	}
 	// now copy over the data
 	const_data_ptr_t source_data;
 	if (source.GetVectorType() == VectorType::CONSTANT_VECTOR) {

@@ -153,8 +153,10 @@ static void DispatchWiden(PhysicalType stored, PhysicalType target, FUNC &&fun) 
 			return fun(uint8_t(0), dst);
 		case 2:
 			return fun(uint16_t(0), dst);
-		default:
+		case 4:
 			return fun(uint32_t(0), dst);
+		default:
+			return fun(uint64_t(0), dst);
 		}
 	};
 	switch (GetTypeIdSize(target)) {
@@ -168,24 +170,28 @@ static void DispatchWiden(PhysicalType stored, PhysicalType target, FUNC &&fun) 
 }
 
 void ForVector::WidenInPlace(data_ptr_t data, PhysicalType stored, PhysicalType target_type, idx_t count) {
+	if (GetTypeIdSize(stored) == GetTypeIdSize(target_type)) {
+		return; // a full-width payload only carries the max: dropping the flag is the whole widen
+	}
 	DispatchWiden(stored, target_type,
 	              [&](auto s, auto d) { WidenInPlaceLoop<decltype(s), decltype(d)>(data, count); });
 }
 
 template <class SRC, class DST>
 DUCKDB_AUTOVEC_TARGET static void WidenGatherLoop(const_data_ptr_t src_p, data_ptr_t target, const SelectionVector &sel,
-                                                  idx_t count) {
+                                                  idx_t count, idx_t sel_offset) {
 	auto src = reinterpret_cast<const SRC *>(src_p);
 	auto dst = reinterpret_cast<DST *>(target);
 	for (idx_t i = 0; i < count; i++) {
-		dst[i] = static_cast<DST>(src[sel.get_index(i)]);
+		dst[i] = static_cast<DST>(src[sel.get_index(sel_offset + i)]);
 	}
 }
 
 void ForVector::WidenGather(const_data_ptr_t src, PhysicalType stored, data_ptr_t target, PhysicalType target_type,
-                            const SelectionVector &sel, idx_t count) {
-	DispatchWiden(stored, target_type,
-	              [&](auto s, auto d) { WidenGatherLoop<decltype(s), decltype(d)>(src, target, sel, count); });
+                            const SelectionVector &sel, idx_t count, idx_t sel_offset) {
+	DispatchWiden(stored, target_type, [&](auto s, auto d) {
+		WidenGatherLoop<decltype(s), decltype(d)>(src, target, sel, count, sel_offset);
+	});
 }
 
 void ForVector::WidenInPlace(const LogicalType &type, VectorBuffer &buffer) {
