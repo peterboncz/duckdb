@@ -157,11 +157,10 @@ public:
 	idx_t for_count = 0;
 	//! True when a VectorCache owns this buffer, so the payload has full stride and can be widened in place
 	bool cache_owned = false;
-	//! FOR token: a producer emits FOR only while this is set. A full widen spends it (nothing used the narrow
-	//! payload) and an exploit site refills it. for_probe re-arms a spent token every PROBE vectors, so one
-	//! unexploited vector cannot disable a column permanently - the cost of being wrong is 1 vector in PROBE.
-	bool for_active = true;
-	uint16_t for_probe = 0;
+	//! Vectors to skip before producing FOR again. Zero means produce it. A full widen (nothing used the narrow
+	//! payload) sets a cooldown and an exploit site clears it, so the cost of guessing wrong is bounded to the
+	//! cooldown rather than the rest of the query.
+	uint16_t for_cooldown = 0;
 
 public:
 	//! Returns the actual size to reserve (a power-of-two)

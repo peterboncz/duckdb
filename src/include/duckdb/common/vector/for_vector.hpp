@@ -44,24 +44,20 @@ struct ForVector {
 	static uint64_t MaxStored(const Vector &vector) {
 		return vector.GetBufferRef()->for_max;
 	}
-	//! Keepalive: producers emit FOR while the token is set. A full widen spends it (nothing used the narrow
-	//! payload); an exploit site refills it.
+	//! Vectors to sit out after a wasted widen. One in COOLDOWN is a probe, so a column whose consumers start
+	//! using the narrow payload recovers instead of staying off for the rest of the query.
+	static constexpr uint16_t COOLDOWN = 64;
+	//! True when the producer should emit FOR. Counts down a cooldown as a side effect.
 	static bool TokenSet(const Vector &vector) {
-		auto &buffer = *vector.GetBufferRef();
-		if (buffer.for_active) {
+		auto &cooldown = vector.GetBufferRef()->for_cooldown;
+		if (cooldown == 0) {
 			return true;
 		}
-		// periodically re-arm: the consumer mix can change, and a single widen must not be terminal
-		static constexpr uint16_t PROBE = 64;
-		if (++buffer.for_probe < PROBE) {
-			return false;
-		}
-		buffer.for_probe = 0;
-		buffer.for_active = true;
-		return true;
+		cooldown--;
+		return false;
 	}
 	static void MarkExploited(const Vector &vector) {
-		vector.GetBufferRef()->for_active = true;
+		vector.GetBufferRef()->for_cooldown = 0;
 	}
 	//! Hand a narrow payload straight to an integer downcast of the same width, with no copy. False when the cast
 	//! is not a pure reinterpretation of the payload, so the caller must run the real cast.

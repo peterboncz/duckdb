@@ -171,10 +171,8 @@ void ForVector::WidenGather(const_data_ptr_t src, PhysicalType stored, data_ptr_
 
 void ForVector::WidenInPlace(const LogicalType &type, VectorBuffer &buffer) {
 	WidenInPlace(buffer.GetData(), buffer.for_stored_type, type.InternalType(), buffer.for_count);
-	// a full widen means nothing used the narrow payload: stop producing it until an exploit site refills the
-	// token or TokenSet re-arms it on its next probe
-	buffer.for_active = false;
-	buffer.for_probe = 0;
+	// nothing used the narrow payload: sit out a cooldown before producing it again
+	buffer.for_cooldown = COOLDOWN;
 	buffer.SetVectorTypeOnly(VectorType::FLAT_VECTOR);
 	buffer.for_stored_type = PhysicalType::INVALID;
 }
