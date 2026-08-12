@@ -1,6 +1,8 @@
 #include "duckdb/common/vector/for_vector.hpp"
 
 #include "duckdb/common/autovec.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 
 namespace duckdb {
 
@@ -13,6 +15,42 @@ void ForVector::Create(Vector &vector, PhysicalType stored_type, uint64_t max_st
 	buffer.for_stored_type = stored_type;
 	buffer.for_max = max_stored;
 	buffer.for_active = false; // spent on producing; an exploit site refills it
+}
+
+bool ForVector::TryRetype(Vector &source, Vector &result, idx_t count) {
+	if (source.GetVectorType() == VectorType::DICTIONARY_VECTOR) {
+		// a sliced input retypes its child and keeps the same selection
+		auto &child = DictionaryVector::Child(source);
+		Vector retyped(result.GetType(), buffer_ptr<VectorBuffer>());
+		if (!TryRetype(child, retyped, child.size())) {
+			return false;
+		}
+		result.Dictionary(make_buffer<DictionaryEntry>(std::move(retyped)), DictionaryVector::SelVector(source), count);
+		return true;
+	}
+	// only a plain integer narrowing reinterprets the payload as-is; decimal rescaling, dates and enums do not
+	if (!IsFor(source) || !source.GetType().IsIntegral() || !result.GetType().IsIntegral()) {
+		return false;
+	}
+	const auto target_size = GetTypeIdSize(result.GetType().InternalType());
+	if (GetTypeIdSize(StoredType(source)) != target_size || target_size > 4) {
+		return false; // only an exact-width handoff avoids the copy
+	}
+	// every value is in [0, for_max], so the cast cannot fail once the target holds for_max
+	const uint64_t target_max = result.GetType().IsSigned() ? (uint64_t(1) << (target_size * 8 - 1)) - 1
+	                                                        : (uint64_t(1) << (target_size * 8)) - 1;
+	if (MaxStored(source) > target_max) {
+		return false;
+	}
+	auto buffer = make_buffer<StandardVectorBuffer>(source.BufferMutable().GetData(), count_t(count), target_size);
+	buffer->GetValidityMask().Initialize(source.Buffer().GetValidityMask());
+	buffer->AddAuxiliaryData(make_uniq<VectorBufferHolder>(source.GetBufferRef()));
+	// the view aliases the payload, so the source must lose its in-place widen permission: a later flatten has to
+	// copy out rather than rewrite the bytes this view is showing
+	source.BufferMutable().cache_owned = false;
+	MarkExploited(source); // the retype used the narrow payload: keep the scan producing FOR for this column
+	result.SetBuffer(std::move(buffer));
+	return true;
 }
 
 bool ForVector::TryStoredConstant(const Vector &vector, const Value &constant, uint64_t &result) {
