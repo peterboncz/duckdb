@@ -90,14 +90,16 @@ DUCKDB_AUTOVEC_TARGET inline bool SelectComparisonFromChunk(ExecuteFunctionState
                                                             const SelectionVector *sel, idx_t count,
                                                             SelectionResult *bitmap_sel, SelectionVector *true_sel,
                                                             SelectionVector *false_sel, idx_t &result) {
-	if (!AutoVecCountPaysOff(count)) { // sparse/small inputs stay on the classic select path
-		return false;
-	}
 	if (false_sel && !bitmap_sel) { // a false side needs the complement: leave it to the classic select
 		return false;
 	}
 	const auto &info = fstate.cmp_info;
 	auto &col = chunk.data[info.ref->Index()]; // dense compare reads the flat input directly
+	// A narrow payload is worth comparing however few rows are selected: the classic path widens the whole payload
+	// to read it, so the dense narrow compare is cheaper even at low selectivity. Only non-FOR inputs bail here.
+	if (!ForVector::IsFor(col) && !AutoVecCountPaysOff(count)) {
+		return false;
+	}
 	auto pt = col.GetType().InternalType();
 	// hook 2: a narrow payload compares in stored space, where the same kernels move fewer bytes per lane
 	uint64_t stored_constant = 0;
@@ -134,7 +136,9 @@ DUCKDB_AUTOVEC_TARGET inline bool SelectComparisonFromChunk(ExecuteFunctionState
 	if (span > STANDARD_VECTOR_SIZE) {                  // bitmap scratch is vector-sized
 		return false;
 	}
-	if (have_sel && !DenseAutoVecPaysOff(count, span, GetTypeIdSize(pt))) {
+	// A narrow payload stays on the dense path however selective the input is: bailing hands it to the generic
+	// path, which widens the whole payload to compare it, so the narrow compare over the full span is cheaper.
+	if (have_sel && !stored && !DenseAutoVecPaysOff(count, span, GetTypeIdSize(pt))) {
 		return false;
 	}
 	SelectionResult &t = bitmap_sel ? *bitmap_sel : fstate.tmp_sel1; // true-side bitmap
