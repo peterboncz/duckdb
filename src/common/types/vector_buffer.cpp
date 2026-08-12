@@ -7,6 +7,7 @@
 #include "duckdb/common/vector/shredded_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/common/types/vector_buffer.hpp"
 
 #include "duckdb/common/assert.hpp"
@@ -41,6 +42,7 @@ void VectorBuffer::SetVectorSize(idx_t new_size) {
 	switch (vector_type) {
 	case VectorType::CONSTANT_VECTOR:
 		break;
+	case VectorType::FOR_VECTOR: // a narrow payload lives in a flat allocation and resizes the same way
 	case VectorType::FLAT_VECTOR:
 		if (new_size > Capacity()) {
 			throw InternalException(
@@ -177,6 +179,10 @@ buffer_ptr<VectorBuffer> VectorBuffer::FlattenSliceInternal(const LogicalType &t
 }
 
 buffer_ptr<VectorBuffer> VectorBuffer::Slice(const LogicalType &type, idx_t offset, idx_t end) {
+	if (vector_type == VectorType::FOR_VECTOR) {
+		// an offset slice re-points into the payload at the logical stride, so widen first
+		ForVector::WidenInPlace(type, *this);
+	}
 	if (vector_type == VectorType::CONSTANT_VECTOR) {
 		// constant vectors do not need to get sliced - but we do need to update the count
 		return ConstantSlice(type, count_t(end - offset));
@@ -191,6 +197,10 @@ buffer_ptr<VectorBuffer> VectorBuffer::Slice(const LogicalType &type, idx_t offs
 }
 
 buffer_ptr<VectorBuffer> VectorBuffer::Slice(const LogicalType &type, const SelectionVector &sel, idx_t count) {
+	if (vector_type == VectorType::FOR_VECTOR && !sel.IsSet()) {
+		// only a real selection keeps FOR alive: it wraps the narrow payload as a dictionary child
+		ForVector::WidenInPlace(type, *this);
+	}
 	if (vector_type == VectorType::CONSTANT_VECTOR) {
 		// constant vectors do not need to get sliced - but we do need to update the count
 		return ConstantSlice(type, count_t(count));
@@ -315,6 +325,9 @@ void VectorBuffer::Copy(const Vector &source_p, const SelectionVector &source_se
 			break;
 		case VectorType::FLAT_VECTOR:
 			finished = true;
+			break;
+		case VectorType::FOR_VECTOR:
+			source.Flatten(); // in-place widen: the next iteration sees a flat source
 			break;
 		default: {
 			// for exotic types we flatten followed by copying

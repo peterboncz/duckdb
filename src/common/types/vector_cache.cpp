@@ -55,6 +55,7 @@ public:
 		result.SetBuffer(buffer_ptr<VectorBuffer>(buffer));
 		result.BufferMutable().ResetCapacity(capacity);
 		result.BufferMutable().SetVectorTypeOnly(VectorType::FLAT_VECTOR);
+		result.BufferMutable().cache_owned = false;
 		switch (internal_type) {
 		case PhysicalType::LIST: {
 			// reinitialize the VectorListBuffer
@@ -129,6 +130,9 @@ void VectorCache::ResetFromCache(Vector &result) const {
 		return;
 	}
 	cache_entry->ResetFromCache(result);
+	// only the top-level vector may carry a FOR payload: nested children are read through parents that would have
+	// to recurse into them, so the recursive reset above deliberately leaves cache_owned unset on children
+	result.BufferMutable().cache_owned = true;
 }
 
 const LogicalType &VectorCache::GetType() const {

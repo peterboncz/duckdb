@@ -51,7 +51,8 @@ idx_t StandardVectorBuffer::GetAllocationSize() const {
 }
 
 void StandardVectorBuffer::VerifyInternal(const LogicalType &type, const SelectionVector &sel, idx_t count) const {
-	D_ASSERT(vector_type == VectorType::FLAT_VECTOR || vector_type == VectorType::CONSTANT_VECTOR);
+	D_ASSERT(vector_type == VectorType::FLAT_VECTOR || vector_type == VectorType::CONSTANT_VECTOR ||
+	         vector_type == VectorType::FOR_VECTOR);
 	if (type_size != GetTypeIdSize(type.InternalType())) {
 		throw InternalException("Type size mismatch in flat vector buffer");
 	}

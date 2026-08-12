@@ -1,3 +1,4 @@
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/common/vector/constant_vector.hpp"
 #include "duckdb/common/vector/dictionary_vector.hpp"
@@ -334,10 +335,12 @@ void Vector::Append(const Value &value, VectorAppendMode append_mode) {
 }
 
 void Vector::Append(const Vector &source, idx_t count, VectorAppendMode append_mode) {
+	ForVector::Widen(*this); // appending wide values behind a narrow payload would mix strides
 	buffer->Append(source, *FlatVector::IncrementalSelectionVector(), count, append_mode);
 }
 
 void Vector::Append(const Vector &source, const SelectionVector &sel, idx_t count, VectorAppendMode append_mode) {
+	ForVector::Widen(*this);
 	buffer->Append(source, sel, count, append_mode);
 }
 
@@ -348,10 +351,12 @@ void Vector::Copy(const Vector &source, const SelectionVector &source_sel, idx_t
 }
 
 void Vector::SetValue(idx_t index, const Value &val) {
+	ForVector::Widen(*this);
 	buffer->SetValue(GetType(), index, val);
 }
 
 Value Vector::GetValueInternal(const Vector &v_p, idx_t index_p) {
+	ForVector::Widen(v_p);
 	return v_p.buffer->GetValue(v_p.GetType(), index_p);
 }
 
@@ -387,6 +392,8 @@ string VectorTypeToString(VectorType type) {
 		return "CONSTANT";
 	case VectorType::SHREDDED_VECTOR:
 		return "SHREDDED";
+	case VectorType::FOR_VECTOR:
+		return "FOR";
 	default:
 		return "UNKNOWN";
 	}
@@ -438,6 +445,12 @@ void Vector::Flatten(idx_t count) const {
 }
 
 void Vector::Flatten() const {
+	if (buffer->GetVectorType() == VectorType::FOR_VECTOR) {
+		// the narrow payload sits in a full-stride allocation: widen it where it is, so every vector
+		// referencing this buffer sees flat data
+		ForVector::WidenInPlace(GetType(), *buffer);
+		return;
+	}
 	auto new_buffer = Buffer().Flatten(GetType());
 	if (new_buffer) {
 		buffer = std::move(new_buffer);
@@ -445,6 +458,7 @@ void Vector::Flatten() const {
 }
 
 void Vector::Flatten(const SelectionVector &sel, idx_t count) const {
+	ForVector::Widen(*this);
 	auto new_buffer = Buffer().FlattenSlice(GetType(), sel, count);
 	if (new_buffer) {
 		buffer = std::move(new_buffer);

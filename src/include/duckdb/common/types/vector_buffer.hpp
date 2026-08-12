@@ -36,7 +36,8 @@ enum class VectorBufferType : uint8_t {
 	DICTIONARY_BUFFER, // VectorType::DICTIONARY    - Any             - Holds SelectionVector and dict child vector
 	FSST_BUFFER,       // VectorType::FSST          - String          - Holds string_t array, StringHeap and FSST table
 	SHREDDED_BUFFER,   // VectorType::SHREDDED      - Variant         - Holds shredded variant
-	SEQUENCE_BUFFER    // VectorType::SEQUENCE      - Any             - Holds linear numeric sequence (start, increment)
+	SEQUENCE_BUFFER // VectorType::SEQUENCE      - Any             - Holds linear numeric sequence (start, increment)
+	                // VectorType::FOR has no buffer of its own: it is a flag on a STANDARD_BUFFER
 };
 
 enum class VectorAppendMode { ALLOW_RESIZE, ERROR_ON_NO_SPACE };
@@ -148,6 +149,14 @@ public:
 	inline VectorBufferType GetBufferType() const {
 		return buffer_type;
 	}
+
+	//! Inline FOR state: only meaningful while the vector type is FOR_VECTOR
+	PhysicalType for_stored_type = PhysicalType::INVALID;
+	uint64_t for_max = 0;
+	//! True when a VectorCache owns this buffer, so the payload has full stride and can be widened in place
+	bool cache_owned = false;
+	//! FOR token: a producer emits FOR only while this is set and spends it; an exploit site refills it
+	bool for_active = true;
 
 public:
 	//! Returns the actual size to reserve (a power-of-two)

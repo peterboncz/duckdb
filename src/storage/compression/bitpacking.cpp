@@ -1,3 +1,4 @@
+#include "duckdb/common/autovec.hpp"
 #include "duckdb/common/bitpacking.hpp"
 
 #include "duckdb/common/limits.hpp"
@@ -6,6 +7,7 @@
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/operator/multiply.hpp"
 #include "duckdb/common/operator/subtract.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/function/compression/compression.hpp"
 #include "duckdb/function/compression_function.hpp"
 #include "duckdb/main/config.hpp"
@@ -620,6 +622,9 @@ public:
 	data_ptr_t current_group_ptr;
 	data_ptr_t bitpacking_metadata_ptr;
 
+	//! Keepalive: set once a chunk's FOR payload went unexploited, stopping FOR emission from then on
+
+
 public:
 	//! Loads the metadata for the current metadata group. This will set bitpacking_metadata_ptr to the next group.
 	//! It also loads any metadata at the start of a compressed buffer (e.g. the width, for, or constant value)
@@ -752,13 +757,109 @@ unique_ptr<SegmentScanState> BitpackingInitScan(const QueryContext &context, Col
 //===--------------------------------------------------------------------===//
 // Scan base data
 //===--------------------------------------------------------------------===//
+//! Byte width that holds this group's absolute values, or 0 when nothing is narrower than T.
+//! The frame is folded into the payload, so the narrow type must cover frame + the widest delta.
+template <class T>
+static idx_t FORStoredSize(T frame, bitpacking_width_t width) {
+	if (sizeof(T) > sizeof(uint64_t) || width == 0 || width >= sizeof(T) * 8 || frame < 0) {
+		return 0; // 16-byte payloads stay on the wide path
+	}
+	const uint64_t max_delta = (uint64_t(1) << width) - 1;
+	const auto unsigned_frame = static_cast<uint64_t>(frame);
+	if (unsigned_frame > NumericLimits<uint64_t>::Maximum() - max_delta) {
+		return 0;
+	}
+	const uint64_t group_max = unsigned_frame + max_delta;
+	const idx_t size = group_max <= 0xFF ? 1 : (group_max <= 0xFFFF ? 2 : (group_max <= 0xFFFFFFFF ? 4 : 8));
+	return size < sizeof(T) ? size : 0;
+}
+
+//! The same unpack kernel, instantiated at the stored width, with the frame folded in
+static void FORUnpack(idx_t stored_size, data_ptr_t dst, data_ptr_t src, idx_t count, bitpacking_width_t width,
+                      uint64_t frame) {
+	switch (stored_size) {
+	case 1:
+		return BitpackingPrimitives::UnPackBuffer<uint8_t>(dst, src, count, width, true, static_cast<uint8_t>(frame));
+	case 2:
+		return BitpackingPrimitives::UnPackBuffer<uint16_t>(dst, src, count, width, true, static_cast<uint16_t>(frame));
+	default:
+		return BitpackingPrimitives::UnPackBuffer<uint32_t>(dst, src, count, width, true, static_cast<uint32_t>(frame));
+	}
+}
+
+//! Hook 1 state: accumulates a narrow payload across metadata groups, straight into the result's own buffer.
+//! Groups usually agree on the stored width, so the common case stays narrow; a group that does not fit
+//! abandons FOR by widening what was written so far.
+template <class T>
+struct FORScanTarget {
+	FORScanTarget(BitpackingScanState<T> &scan_state_p, Vector &result_p, idx_t result_offset, idx_t scan_count)
+	    : scan_state(scan_state_p), result(result_p) {
+		active = result_offset == 0 && sizeof(T) > 1 && CpuBenefitsFromAutoVec() &&
+		         scan_count <= STANDARD_VECTOR_SIZE && result.GetBufferRef()->cache_owned &&
+		         ForVector::TokenSet(result);
+	}
+
+	//! Can this group's run join the narrow payload? Fixes the stored width on the first accepted group.
+	bool Accept(idx_t offset_in_compression_group) {
+		if (!active || offset_in_compression_group != 0) {
+			return false; // mid-algorithm-group runs would need a scratch decode: not worth the code
+		}
+		const auto size = FORStoredSize<T>(scan_state.current_frame_of_reference, scan_state.current_width);
+		if (size == 0 || (stored_size != 0 && size != stored_size)) {
+			return false;
+		}
+		stored_size = size;
+		const uint64_t group_max = static_cast<uint64_t>(scan_state.current_frame_of_reference) +
+		                           ((uint64_t(1) << scan_state.current_width) - 1);
+		max_stored = MaxValue(max_stored, group_max);
+		return true;
+	}
+
+	void Decode(data_ptr_t payload, idx_t written, idx_t count) {
+		auto src = scan_state.current_group_ptr + scan_state.current_group_offset * scan_state.current_width / 8;
+		FORUnpack(stored_size, payload + written * stored_size, src, count, scan_state.current_width,
+		          static_cast<uint64_t>(scan_state.current_frame_of_reference));
+	}
+
+	//! Give up on FOR: widen everything written so far in place and stop trying
+	void Abandon(data_ptr_t payload, idx_t written) {
+		if (stored_size != 0) {
+			ForVector::WidenPayload(payload, StoredPhysicalType(), payload, GetTypeId<T>(), written);
+			stored_size = 0;
+		}
+		active = false;
+	}
+
+	//! Mark the result as FOR, leaving the narrow payload where it was written
+	void Publish(idx_t count) {
+		if (stored_size == 0) {
+			return;
+		}
+		ForVector::Create(result, StoredPhysicalType(), max_stored, count);
+	}
+
+	PhysicalType StoredPhysicalType() const {
+		return stored_size == 1 ? PhysicalType::UINT8 : (stored_size == 2 ? PhysicalType::UINT16 : PhysicalType::UINT32);
+	}
+
+	BitpackingScanState<T> &scan_state;
+	Vector &result;
+	bool active;
+	idx_t stored_size = 0;
+	uint64_t max_stored = 0;
+};
+
 template <class T, class T_S = typename MakeSigned<T>::type, class T_U = typename MakeUnsigned<T>::type>
 void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result,
                            idx_t result_offset) {
 	auto &scan_state = state.scan_state->Cast<BitpackingScanState<T>>();
 
+	ForVector::Widen(result); // a payload left in a reused result must go before we write at the logical stride
+
 	T *result_data = FlatVector::GetDataMutable<T>(result);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
+	FORScanTarget<T> for_target(scan_state, result, result_offset, scan_count);
+	auto payload = data_ptr_cast(result_data);
 
 	//! Because FOR offsets all our values to be 0 or above, we can always skip sign extension here
 	bool skip_sign_extend = true;
@@ -776,6 +877,7 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 		    scan_state.current_group_offset % BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE;
 
 		if (scan_state.current_group.mode == BitpackingMode::CONSTANT) {
+			for_target.Abandon(payload, scanned);
 			idx_t remaining = scan_count - scanned;
 			idx_t to_scan = MinValue(remaining, BITPACKING_METADATA_GROUP_SIZE - scan_state.current_group_offset);
 			T *begin = result_data + result_offset + scanned;
@@ -786,6 +888,7 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 			continue;
 		}
 		if (scan_state.current_group.mode == BitpackingMode::CONSTANT_DELTA) {
+			for_target.Abandon(payload, scanned);
 			idx_t remaining = scan_count - scanned;
 			idx_t to_scan = MinValue(remaining, BITPACKING_METADATA_GROUP_SIZE - scan_state.current_group_offset);
 			T *target_ptr = result_data + result_offset + scanned;
@@ -808,6 +911,15 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 		auto remaining =
 		    MinValue<idx_t>(scan_count - scanned, BITPACKING_METADATA_GROUP_SIZE - scan_state.current_group_offset);
 		idx_t to_scan = remaining - (remaining % BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE);
+		if (scan_state.current_group.mode == BitpackingMode::FOR && remaining > 0 &&
+		    for_target.Accept(offset_in_compression_group)) {
+			// hook 1: the narrow payload goes downstream instead of being widened here
+			for_target.Decode(payload, scanned, remaining);
+			scanned += remaining;
+			scan_state.current_group_offset += remaining;
+			continue;
+		}
+		for_target.Abandon(payload, scanned);
 		if (offset_in_compression_group == 0 && to_scan > 0) {
 			// Decompress whole algorithm groups straight into the result, adding the frame inline
 			BitpackingPrimitives::UnPackBuffer<T>(
@@ -838,6 +950,8 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 		scanned += to_scan;
 		scan_state.current_group_offset += to_scan;
 	}
+
+	for_target.Publish(scan_count);
 }
 
 template <class T>

@@ -1,3 +1,4 @@
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/common/vector/map_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
@@ -136,6 +137,10 @@ void ColumnSegment::Scan(ColumnScanState &state, idx_t scan_count, Vector &resul
 		D_ASSERT(result_offset == 0);
 		Scan(state, scan_count, result);
 	} else {
+		if (result_offset > 0) {
+			// an earlier segment published a narrow payload: widen it before appending at the logical stride
+			ForVector::Widen(result);
+		}
 		D_ASSERT(result.GetVectorType() == VectorType::FLAT_VECTOR);
 		ScanPartial(state, scan_count, result, result_offset);
 		D_ASSERT(result.GetVectorType() == VectorType::FLAT_VECTOR);
