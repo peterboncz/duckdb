@@ -5,6 +5,7 @@
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/common/types/bignum.hpp"
 #include "duckdb/common/vector/for_vector.hpp"
+#include "duckdb/common/autovec.hpp"
 
 namespace duckdb {
 
@@ -117,6 +118,14 @@ buffer_ptr<VectorBuffer> StandardVectorBuffer::SliceInternal(const LogicalType &
 		// Incremental selection (rows 0..count-1): produce a flat offset-based sub-view
 		// to avoid creating a DictionaryBuffer with a null selection vector.
 		return SliceInternal(type, idx_t(0), count);
+	}
+	// Sparse selection over a narrow payload: gather-widen the survivors into a reused slot instead of building a
+	// dictionary over the whole narrow child - every consumer of that dictionary would widen the payload anyway.
+	// The gather-vs-dense call is made on the stored width, since the dense alternative reads the narrow payload.
+	if (vector_type == VectorType::FOR_VECTOR &&
+	    !DenseAutoVecPaysOff(count, Size(), GetTypeIdSize(for_stored_type))) {
+		for_cooldown = 0; // the gather exploited the narrow payload: keep the scan producing FOR
+		return FlattenSliceInternal(type, sel, count);
 	}
 	Vector child_vector(type, shared_from_this());
 	auto entry = make_shared_ptr<DictionaryEntry>(std::move(child_vector));
