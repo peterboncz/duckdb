@@ -21,6 +21,21 @@ struct ForVector {
 	}
 	//! Mark a flat vector as FOR: its buffer already holds the narrow payload for the first count rows
 	static void Create(Vector &vector, PhysicalType stored_type, uint64_t max_stored, idx_t count);
+	//! A producer about to overwrite the whole payload can drop the flag instead of widening it. Only safe when
+	//! the writer covers every published row: rows past the new size keep narrow bytes, which is fine because
+	//! nothing reads past the vector size, but a partial overwrite would leave a narrow hole inside it.
+	static void Discard(Vector &vector, idx_t rows_to_write) {
+		if (!IsFor(vector)) {
+			return;
+		}
+		auto &buffer = vector.BufferMutable();
+		if (rows_to_write < buffer.for_count) {
+			Widen(vector);
+			return;
+		}
+		buffer.SetVectorTypeOnly(VectorType::FLAT_VECTOR);
+		buffer.for_stored_type = PhysicalType::INVALID;
+	}
 	//! Safety net for FOR-unaware code: widen back to the logical width. Free - the payload is widened in place.
 	static void Widen(const Vector &vector) {
 		if (IsFor(vector)) {
@@ -50,6 +65,10 @@ struct ForVector {
 	static bool TryStoredConstant(const Vector &vector, const Value &constant, uint64_t &result);
 	//! Widen the payload within its own allocation and turn the vector back into a flat one
 	static void WidenInPlace(const LogicalType &type, VectorBuffer &buffer);
+	//! Gather-widen only the selected values into a target of the logical width. For a selective filter this
+	//! touches the survivors instead of the whole vector, which is the whole point of keeping the payload narrow.
+	static void WidenGather(const_data_ptr_t src, PhysicalType stored, data_ptr_t target, PhysicalType target_type,
+	                        const SelectionVector &sel, idx_t count);
 	//! Widen a narrow payload where it lies. Always in place: a producer abandoning FOR part-way through a vector
 	//! has its source and target in the same bytes, so this must never be a forward copy.
 	static void WidenInPlace(data_ptr_t data, PhysicalType stored, PhysicalType target_type, idx_t count);

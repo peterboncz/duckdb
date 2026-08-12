@@ -56,10 +56,9 @@ public:
 		buffer->ClearAuxiliaryData();
 		result.SetBuffer(buffer_ptr<VectorBuffer>(buffer));
 		result.BufferMutable().ResetCapacity(capacity);
-		if (result.BufferMutable().GetVectorType() == VectorType::FOR_VECTOR) {
-			// clearing the flag without widening would leave narrow bytes behind that read as the logical width
-			ForVector::WidenInPlace(type, result.BufferMutable());
-		}
+		// the reset drops the payload: size goes to 0 below and the next producer overwrites the bytes, so the
+		// flag can go without widening. Widening here was ~38% of all widens on a filtered scan.
+		result.BufferMutable().for_stored_type = PhysicalType::INVALID;
 		result.BufferMutable().SetVectorTypeOnly(VectorType::FLAT_VECTOR);
 		result.BufferMutable().cache_owned = false;
 		switch (internal_type) {

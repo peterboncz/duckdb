@@ -1,9 +1,6 @@
 #include "duckdb/common/vector/for_vector.hpp"
 
 #include "duckdb/common/autovec.hpp"
-#include "duckdb/common/vector/dictionary_vector.hpp"
-#include "duckdb/common/vector/flat_vector.hpp"
-
 namespace duckdb {
 
 void ForVector::Create(Vector &vector, PhysicalType stored_type, uint64_t max_stored, idx_t count) {
@@ -123,6 +120,41 @@ void ForVector::WidenInPlace(data_ptr_t data, PhysicalType stored, PhysicalType 
 		return WidenInPlaceTo<uint32_t>(data, stored, count);
 	default:
 		return WidenInPlaceTo<uint64_t>(data, stored, count);
+	}
+}
+
+template <class SRC, class DST>
+DUCKDB_AUTOVEC_TARGET static void WidenGatherLoop(const_data_ptr_t src_p, data_ptr_t target, const SelectionVector &sel,
+                                                  idx_t count) {
+	auto src = reinterpret_cast<const SRC *>(src_p);
+	auto dst = reinterpret_cast<DST *>(target);
+	for (idx_t i = 0; i < count; i++) {
+		dst[i] = static_cast<DST>(src[sel.get_index(i)]);
+	}
+}
+
+template <class DST>
+static void WidenGatherTo(const_data_ptr_t src, PhysicalType stored, data_ptr_t target, const SelectionVector &sel,
+                          idx_t count) {
+	switch (GetTypeIdSize(stored)) {
+	case 1:
+		return WidenGatherLoop<uint8_t, DST>(src, target, sel, count);
+	case 2:
+		return WidenGatherLoop<uint16_t, DST>(src, target, sel, count);
+	default:
+		return WidenGatherLoop<uint32_t, DST>(src, target, sel, count);
+	}
+}
+
+void ForVector::WidenGather(const_data_ptr_t src, PhysicalType stored, data_ptr_t target, PhysicalType target_type,
+                            const SelectionVector &sel, idx_t count) {
+	switch (GetTypeIdSize(target_type)) {
+	case 2:
+		return WidenGatherTo<uint16_t>(src, stored, target, sel, count);
+	case 4:
+		return WidenGatherTo<uint32_t>(src, stored, target, sel, count);
+	default:
+		return WidenGatherTo<uint64_t>(src, stored, target, sel, count);
 	}
 }
 

@@ -1,4 +1,5 @@
 #include "duckdb/common/vector/for_vector.hpp"
+#include "duckdb/common/autovec.hpp"
 #include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/common/vector/constant_vector.hpp"
 #include "duckdb/common/vector/dictionary_vector.hpp"
@@ -472,8 +473,15 @@ void Vector::ToUnifiedFormat(idx_t count, UnifiedVectorFormat &format) const {
 void Vector::ToUnifiedFormat(UnifiedVectorFormat &format) const {
 	format.physical_type = GetType().InternalType();
 	auto vtype = GetVectorType();
-	if (vtype != VectorType::FLAT_VECTOR && vtype != VectorType::CONSTANT_VECTOR &&
-	    vtype != VectorType::DICTIONARY_VECTOR) {
+	if (vtype == VectorType::DICTIONARY_VECTOR) {
+		// a sparse selection over a narrow payload: gather-widen the survivors rather than the whole child
+		auto &child = DictionaryVector::Child(*this);
+		if (ForVector::IsFor(child) &&
+		    !DenseAutoVecPaysOff(size(), child.size(), GetTypeIdSize(ForVector::StoredType(child)))) {
+			ForVector::MarkExploited(child); // the gather read the narrow payload: keep the scan producing FOR
+			Flatten();
+		}
+	} else if (vtype != VectorType::FLAT_VECTOR && vtype != VectorType::CONSTANT_VECTOR) {
 		// FSST/SEQUENCE/SHREDDED: flatten first so the buffer can provide unified format
 		Flatten();
 	}

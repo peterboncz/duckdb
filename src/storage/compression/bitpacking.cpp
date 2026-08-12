@@ -798,6 +798,7 @@ struct FORScanTarget {
 		active = allow_for && result_offset == 0 && sizeof(T) > 1 && CpuBenefitsFromAutoVec() &&
 		         scan_count <= STANDARD_VECTOR_SIZE && result.GetBufferRef()->cache_owned &&
 		         ForVector::TokenSet(result);
+
 	}
 
 	//! Can this group's run join the narrow payload? Fixes the stored width on the first accepted group.

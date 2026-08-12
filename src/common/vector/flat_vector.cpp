@@ -4,6 +4,7 @@
 #include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/common/types/bignum.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 
 namespace duckdb {
 
@@ -204,7 +205,12 @@ buffer_ptr<VectorBuffer> StandardVectorBuffer::FlattenSliceInternal(const Logica
 	auto &allocator = stored_allocator ? *stored_allocator : Allocator::DefaultAllocator();
 	auto new_data = allocator.Allocate(target_byte_count);
 	// copy data using sel
-	FlattenVectorBuffer(new_data.get(), data_ptr, sel, count, type_size);
+	if (vector_type == VectorType::FOR_VECTOR) {
+		// gather straight out of the narrow payload: only the selected rows get widened
+		ForVector::WidenGather(data_ptr, for_stored_type, new_data.get(), type.InternalType(), sel, count);
+	} else {
+		FlattenVectorBuffer(new_data.get(), data_ptr, sel, count, type_size);
+	}
 
 	auto result = CreateBuffer(std::move(new_data), count_t(count));
 	// copy validity using sel

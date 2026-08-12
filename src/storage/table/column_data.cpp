@@ -143,9 +143,10 @@ void ColumnData::InitializeScanWithOffset(ColumnScanState &state, idx_t row_idx)
 
 ScanVectorType ColumnData::GetVectorScanType(ColumnScanState &state, idx_t scan_count, Vector &result) {
 	// a payload left by an earlier chunk must not read as "not flat" here: that would pick the entire-vector path
-	// for a scan that has to cross segments, and the scan would then cover only part of the vector
-	ForVector::Widen(result);
-	if (result.GetVectorType() != VectorType::FLAT_VECTOR) {
+	// for a scan that has to cross segments, and the scan would then cover only part of the vector. A FOR buffer is
+	// a flat allocation, so it takes the same decision - widening it here would just undo the scan's own Discard.
+	const auto result_vtype = result.GetVectorType();
+	if (result_vtype != VectorType::FLAT_VECTOR && result_vtype != VectorType::FOR_VECTOR) {
 		return ScanVectorType::SCAN_ENTIRE_VECTOR;
 	}
 	if (HasUpdates()) {
@@ -215,7 +216,12 @@ idx_t ColumnData::ScanVector(ColumnScanState &state, Vector &result, idx_t remai
 	// dropping the flag is required: a scan does not always cover the whole published payload. The validity column
 	// scans into the same result vector but only touches the mask, so it must not undo what the data scan published.
 	if (type.id() != LogicalTypeId::VALIDITY) {
-		ForVector::Widen(result);
+		// this scan is about to rewrite the payload, so widening it first is wasted work
+		if (base_result_offset == 0) {
+			ForVector::Discard(result, remaining);
+		} else {
+			ForVector::Widen(result);
+		}
 	}
 	if (scan_type == ScanVectorType::SCAN_FLAT_VECTOR && result.GetVectorType() != VectorType::FLAT_VECTOR) {
 		throw InternalException("ScanVector called with SCAN_FLAT_VECTOR but result is not a flat vector");

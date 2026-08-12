@@ -16,6 +16,8 @@
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 
+#include "duckdb/common/vector/for_vector.hpp"
+
 namespace duckdb {
 
 namespace {
@@ -295,9 +297,57 @@ void ArrayLoopHash(const Vector &input, Vector &hashes, const SelectionVector *r
 	}
 }
 
+//! Hash a narrow payload with the existing kernel. Hash() funnels every integer width through
+//! MurmurHash64 after a zero-extending cast, so for the non-negative values below 2^32 that a FOR payload holds,
+//! Hash<uint8/16/32> and Hash<the logical type> are the same value. This is a re-dispatch, not a different
+//! computation - and it keeps the payload narrow for a downstream retype instead of widening it here.
+template <bool HAS_RSEL>
+bool TryHashFor(const Vector &input, Vector &result, const SelectionVector *rsel, idx_t count) {
+	const Vector *payload = &input;
+	const SelectionVector *sel = nullptr;
+	if (input.GetVectorType() == VectorType::DICTIONARY_VECTOR) {
+		payload = &DictionaryVector::Child(input);
+		sel = &DictionaryVector::SelVector(input);
+	}
+	if (!ForVector::IsFor(*payload)) {
+		return false;
+	}
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	FlatVector::SetSize(result, count_t(count));
+	const auto ldata = FlatVector::GetDataUnsafe(*payload);
+	const auto &mask = payload->Buffer().GetValidityMask();
+	auto result_data = FlatVector::GetDataMutable<hash_t>(result);
+	const bool has_sel = sel && sel->IsSet();
+	switch (GetTypeIdSize(ForVector::StoredType(*payload))) {
+	case 1:
+		has_sel ? TightLoopHash<HAS_RSEL, true, uint8_t, false>(reinterpret_cast<const uint8_t *>(ldata), result_data,
+		                                                        rsel, count, sel, mask)
+		        : TightLoopHash<HAS_RSEL, false, uint8_t, false>(reinterpret_cast<const uint8_t *>(ldata), result_data,
+		                                                         rsel, count, sel, mask);
+		break;
+	case 2:
+		has_sel ? TightLoopHash<HAS_RSEL, true, uint16_t, false>(reinterpret_cast<const uint16_t *>(ldata), result_data,
+		                                                         rsel, count, sel, mask)
+		        : TightLoopHash<HAS_RSEL, false, uint16_t, false>(reinterpret_cast<const uint16_t *>(ldata),
+		                                                          result_data, rsel, count, sel, mask);
+		break;
+	default:
+		has_sel ? TightLoopHash<HAS_RSEL, true, uint32_t, false>(reinterpret_cast<const uint32_t *>(ldata), result_data,
+		                                                         rsel, count, sel, mask)
+		        : TightLoopHash<HAS_RSEL, false, uint32_t, false>(reinterpret_cast<const uint32_t *>(ldata),
+		                                                          result_data, rsel, count, sel, mask);
+		break;
+	}
+	ForVector::MarkExploited(*payload);
+	return true;
+}
+
 template <bool HAS_RSEL>
 void HashTypeSwitch(const Vector &input, Vector &result, const SelectionVector *rsel, idx_t count) {
 	D_ASSERT(result.GetType().id() == LogicalType::HASH);
+	if (TryHashFor<HAS_RSEL>(input, result, rsel, count)) {
+		return;
+	}
 	switch (input.GetType().InternalType()) {
 	case PhysicalType::BOOL:
 	case PhysicalType::INT8:
