@@ -74,11 +74,10 @@ void CastFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &source = args.data[0];
 	idx_t count = args.size();
 
-	// hook 5: an integer downcast onto the payload's own width is a reinterpretation, so hand it over uncopied
-	if (ForVector::TryRetype(source, result, count)) {
-		if (result.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
-			FlatVector::SetSize(result, count_t(count));
-		}
+	// hook 5: an integer downcast onto the payload's own width is a reinterpretation, handed over uncopied;
+	// the mirror upcast (decompression above a join) keeps the values narrow under a FOR flag
+	if (ForVector::TryRetype(source, result, count) || ForVector::TryPromote(source, result, count)) {
+		FlatVector::SetSize(result, count_t(count));
 		return;
 	}
 

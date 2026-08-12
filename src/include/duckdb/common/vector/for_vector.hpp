@@ -60,8 +60,13 @@ struct ForVector {
 		vector.GetBufferRef()->for_cooldown = 0;
 	}
 	//! Hand a narrow payload straight to an integer downcast of the same width, with no copy. False when the cast
-	//! is not a pure reinterpretation of the payload, so the caller must run the real cast.
+	//! is not a pure reinterpretation of the payload, so the caller must run the real cast. The downcast itself
+	//! exploited the narrow payload, so it refills the source's keepalive.
 	static bool TryRetype(Vector &source, Vector &result, idx_t count);
+	//! An integer upcast (decompression above a join) keeps the values narrow: the result becomes a FOR vector over
+	//! a narrow copy of the input instead of a widened one. Producing this only pays if a later consumer runs
+	//! narrow, so unlike the downcast it is gated on the result's keepalive token.
+	static bool TryPromote(Vector &source, Vector &result, idx_t count);
 	//! Rewrite a comparison constant into the stored space. False when it falls outside the payload's range:
 	//! the comparison is then uniform, which the normal path handles just as well.
 	static bool TryStoredConstant(const Vector &vector, const Value &constant, uint64_t &result);

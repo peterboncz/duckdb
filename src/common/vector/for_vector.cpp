@@ -39,6 +39,48 @@ bool ForVector::TryRetype(Vector &source, Vector &result, idx_t count) {
 	return true;
 }
 
+//! Copy the payload narrow while proving its bounds: half the writes of the widening cast, and the exact for_max.
+template <class T>
+DUCKDB_AUTOVEC_TARGET static bool PromoteLoop(const T *DUCKDB_BITPACKING_RESTRICT src,
+                                              T *DUCKDB_BITPACKING_RESTRICT dst, idx_t count, uint64_t &max_out) {
+	T lo = 0;
+	T hi = 0;
+	DUCKDB_UNROLL_LOOP
+	for (idx_t i = 0; i < count; i++) {
+		dst[i] = src[i];
+		lo = MinValue(lo, src[i]);
+		hi = MaxValue(hi, src[i]);
+	}
+	max_out = static_cast<uint64_t>(hi);
+	return lo >= 0; // a negative value has no unsigned narrow representation
+}
+
+bool ForVector::TryPromote(Vector &source, Vector &result, idx_t cnt) {
+	const auto src_size = GetTypeIdSize(source.GetType().InternalType());
+	const auto dst_size = GetTypeIdSize(result.GetType().InternalType());
+	auto &buffer = result.GetBufferRef();
+	if (!source.GetType().IsIntegral() || !result.GetType().IsIntegral() || src_size > 4 || dst_size > 8 ||
+	    src_size >= dst_size || source.GetVectorType() != VectorType::FLAT_VECTOR || !buffer || !buffer->cache_owned ||
+	    buffer->Capacity() < cnt || !TokenSet(result)) {
+		return false;
+	}
+	auto src = FlatVector::GetDataUnsafe(source);
+	auto dst = buffer->GetData();
+	uint64_t lim;
+	auto promote = [&](auto t) {
+		using T = decltype(t);
+		return PromoteLoop(reinterpret_cast<const T *>(src), reinterpret_cast<T *>(dst), cnt, lim);
+	};
+	const bool fits = src_size == 1 ? promote(int8_t(0)) : src_size == 2 ? promote(int16_t(0)) : promote(int32_t(0));
+	if (!fits) {
+		return false; // the real cast overwrites the partial narrow copy
+	}
+	FlatVector::SetValidity(result, source.Buffer().GetValidityMask());
+	Create(result, src_size == 1 ? PhysicalType::UINT8 : (src_size == 2 ? PhysicalType::UINT16 : PhysicalType::UINT32),
+	       lim, cnt);
+	return true;
+}
+
 //! A constant above the payload's ceiling makes every comparison uniform, and replacing it with for_max + 1 gives
 //! that same answer through the ordinary kernel: no value can equal or exceed it, and every value is below it.
 //! So the comparison stays a narrow one instead of widening the payload to reach a foregone conclusion.
