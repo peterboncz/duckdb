@@ -318,24 +318,24 @@ bool TryHashFor(const Vector &input, Vector &result, const SelectionVector *rsel
 	const auto &mask = payload->Buffer().GetValidityMask();
 	auto result_data = FlatVector::GetDataMutable<hash_t>(result);
 	const bool has_sel = sel && sel->IsSet();
+	auto hash_at = [&](auto t) {
+		using T = decltype(t);
+		auto data = reinterpret_cast<const T *>(ldata);
+		if (has_sel) {
+			TightLoopHash<HAS_RSEL, true, T, false>(data, result_data, rsel, count, sel, mask);
+		} else {
+			TightLoopHash<HAS_RSEL, false, T, false>(data, result_data, rsel, count, sel, mask);
+		}
+	};
 	switch (GetTypeIdSize(ForVector::StoredType(*payload))) {
 	case 1:
-		has_sel ? TightLoopHash<HAS_RSEL, true, uint8_t, false>(reinterpret_cast<const uint8_t *>(ldata), result_data,
-		                                                        rsel, count, sel, mask)
-		        : TightLoopHash<HAS_RSEL, false, uint8_t, false>(reinterpret_cast<const uint8_t *>(ldata), result_data,
-		                                                         rsel, count, sel, mask);
+		hash_at(uint8_t(0));
 		break;
 	case 2:
-		has_sel ? TightLoopHash<HAS_RSEL, true, uint16_t, false>(reinterpret_cast<const uint16_t *>(ldata), result_data,
-		                                                         rsel, count, sel, mask)
-		        : TightLoopHash<HAS_RSEL, false, uint16_t, false>(reinterpret_cast<const uint16_t *>(ldata),
-		                                                          result_data, rsel, count, sel, mask);
+		hash_at(uint16_t(0));
 		break;
 	default:
-		has_sel ? TightLoopHash<HAS_RSEL, true, uint32_t, false>(reinterpret_cast<const uint32_t *>(ldata), result_data,
-		                                                         rsel, count, sel, mask)
-		        : TightLoopHash<HAS_RSEL, false, uint32_t, false>(reinterpret_cast<const uint32_t *>(ldata),
-		                                                          result_data, rsel, count, sel, mask);
+		hash_at(uint32_t(0));
 		break;
 	}
 	ForVector::MarkExploited(*payload);

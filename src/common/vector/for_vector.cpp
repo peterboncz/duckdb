@@ -14,16 +14,6 @@ void ForVector::Create(Vector &vector, PhysicalType stored_type, uint64_t max_st
 }
 
 bool ForVector::TryRetype(Vector &source, Vector &result, idx_t count) {
-	if (source.GetVectorType() == VectorType::DICTIONARY_VECTOR) {
-		// a sliced input retypes its child and keeps the same selection
-		auto &child = DictionaryVector::Child(source);
-		Vector retyped(result.GetType(), buffer_ptr<VectorBuffer>());
-		if (!TryRetype(child, retyped, child.size())) {
-			return false;
-		}
-		result.Dictionary(make_buffer<DictionaryEntry>(std::move(retyped)), DictionaryVector::SelVector(source), count);
-		return true;
-	}
 	// only a plain integer narrowing reinterprets the payload as-is; decimal rescaling, dates and enums do not
 	if (!IsFor(source) || !source.GetType().IsIntegral() || !result.GetType().IsIntegral()) {
 		return false;
@@ -111,27 +101,32 @@ DUCKDB_AUTOVEC_TARGET static void WidenInPlaceLoop(data_ptr_t data, idx_t count)
 	}
 }
 
-template <class DST>
-static void WidenInPlaceTo(data_ptr_t data, PhysicalType stored, idx_t count) {
-	switch (GetTypeIdSize(stored)) {
-	case 1:
-		return WidenInPlaceLoop<uint8_t, DST>(data, count);
+//! Route a (stored, target) width pair to fun(SRC{}, DST{})
+template <class FUNC>
+static void DispatchWiden(PhysicalType stored, PhysicalType target, FUNC &&fun) {
+	auto with_src = [&](auto dst) {
+		switch (GetTypeIdSize(stored)) {
+		case 1:
+			return fun(uint8_t(0), dst);
+		case 2:
+			return fun(uint16_t(0), dst);
+		default:
+			return fun(uint32_t(0), dst);
+		}
+	};
+	switch (GetTypeIdSize(target)) {
 	case 2:
-		return WidenInPlaceLoop<uint16_t, DST>(data, count);
+		return with_src(uint16_t(0));
+	case 4:
+		return with_src(uint32_t(0));
 	default:
-		return WidenInPlaceLoop<uint32_t, DST>(data, count);
+		return with_src(uint64_t(0));
 	}
 }
 
 void ForVector::WidenInPlace(data_ptr_t data, PhysicalType stored, PhysicalType target_type, idx_t count) {
-	switch (GetTypeIdSize(target_type)) {
-	case 2:
-		return WidenInPlaceTo<uint16_t>(data, stored, count);
-	case 4:
-		return WidenInPlaceTo<uint32_t>(data, stored, count);
-	default:
-		return WidenInPlaceTo<uint64_t>(data, stored, count);
-	}
+	DispatchWiden(stored, target_type,
+	              [&](auto s, auto d) { WidenInPlaceLoop<decltype(s), decltype(d)>(data, count); });
 }
 
 template <class SRC, class DST>
@@ -144,29 +139,10 @@ DUCKDB_AUTOVEC_TARGET static void WidenGatherLoop(const_data_ptr_t src_p, data_p
 	}
 }
 
-template <class DST>
-static void WidenGatherTo(const_data_ptr_t src, PhysicalType stored, data_ptr_t target, const SelectionVector &sel,
-                          idx_t count) {
-	switch (GetTypeIdSize(stored)) {
-	case 1:
-		return WidenGatherLoop<uint8_t, DST>(src, target, sel, count);
-	case 2:
-		return WidenGatherLoop<uint16_t, DST>(src, target, sel, count);
-	default:
-		return WidenGatherLoop<uint32_t, DST>(src, target, sel, count);
-	}
-}
-
 void ForVector::WidenGather(const_data_ptr_t src, PhysicalType stored, data_ptr_t target, PhysicalType target_type,
                             const SelectionVector &sel, idx_t count) {
-	switch (GetTypeIdSize(target_type)) {
-	case 2:
-		return WidenGatherTo<uint16_t>(src, stored, target, sel, count);
-	case 4:
-		return WidenGatherTo<uint32_t>(src, stored, target, sel, count);
-	default:
-		return WidenGatherTo<uint64_t>(src, stored, target, sel, count);
-	}
+	DispatchWiden(stored, target_type,
+	              [&](auto s, auto d) { WidenGatherLoop<decltype(s), decltype(d)>(src, target, sel, count); });
 }
 
 void ForVector::WidenInPlace(const LogicalType &type, VectorBuffer &buffer) {

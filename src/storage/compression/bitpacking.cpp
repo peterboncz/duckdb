@@ -774,19 +774,6 @@ static idx_t FORStoredSize(T frame, bitpacking_width_t width) {
 	return size < sizeof(T) ? size : 0;
 }
 
-//! The same unpack kernel, instantiated at the stored width, with the frame folded in
-static void FORUnpack(idx_t stored_size, data_ptr_t dst, data_ptr_t src, idx_t count, bitpacking_width_t width,
-                      uint64_t frame) {
-	switch (stored_size) {
-	case 1:
-		return BitpackingPrimitives::UnPackBuffer<uint8_t>(dst, src, count, width, true, static_cast<uint8_t>(frame));
-	case 2:
-		return BitpackingPrimitives::UnPackBuffer<uint16_t>(dst, src, count, width, true, static_cast<uint16_t>(frame));
-	default:
-		return BitpackingPrimitives::UnPackBuffer<uint32_t>(dst, src, count, width, true, static_cast<uint32_t>(frame));
-	}
-}
-
 //! Hook 1 state: accumulates a narrow payload across metadata groups, straight into the result's own buffer.
 //! Groups usually agree on the stored width, so the common case stays narrow; a group that does not fit
 //! abandons FOR by widening what was written so far.
@@ -820,10 +807,23 @@ struct FORScanTarget {
 		return true;
 	}
 
+	//! The same unpack kernel, instantiated at the stored width, with the frame folded in
 	void Decode(data_ptr_t payload, idx_t written, idx_t count) {
 		auto src = scan_state.current_group_ptr + scan_state.current_group_offset * scan_state.current_width / 8;
-		FORUnpack(stored_size, payload + written * stored_size, src, count, scan_state.current_width,
-		          static_cast<uint64_t>(scan_state.current_frame_of_reference));
+		auto dst = payload + written * stored_size;
+		const auto width = scan_state.current_width;
+		const auto frame = static_cast<uint64_t>(scan_state.current_frame_of_reference);
+		switch (stored_size) {
+		case 1:
+			return BitpackingPrimitives::UnPackBuffer<uint8_t>(dst, src, count, width, true,
+			                                                   static_cast<uint8_t>(frame));
+		case 2:
+			return BitpackingPrimitives::UnPackBuffer<uint16_t>(dst, src, count, width, true,
+			                                                    static_cast<uint16_t>(frame));
+		default:
+			return BitpackingPrimitives::UnPackBuffer<uint32_t>(dst, src, count, width, true,
+			                                                    static_cast<uint32_t>(frame));
+		}
 	}
 
 	//! A delta group only narrows to 4 bytes: that is the width with a SIMD prefix sum, and the only one whose
