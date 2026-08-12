@@ -74,6 +74,13 @@ template <class T>
 struct VectorScatterWriter;
 
 struct FlatVector {
+	//! A typed accessor only checks the logical type, so a FOR payload would silently be read at the wrong stride.
+	//! Widening here is what makes every FOR-unaware kernel correct; the hooks read via GetDataUnsafe instead.
+	static void WidenFor(const Vector &vector) {
+		if (vector.GetVectorType() == VectorType::FOR_VECTOR) {
+			vector.Flatten();
+		}
+	}
 	static void VerifyFlatVector(const Vector &vector) {
 #ifdef DUCKDB_DEBUG_NO_SAFETY
 		D_ASSERT(vector.GetVectorType() == VectorType::FLAT_VECTOR);
@@ -116,11 +123,13 @@ struct FlatVector {
 	template <class T>
 	static inline const T *GetData(const Vector &vector) {
 		ConstantVector::VerifyVectorType<T>(vector);
+		WidenFor(vector);
 		return GetDataUnsafe<T>(vector);
 	}
 	template <class T>
 	static inline T *GetDataMutable(Vector &vector) {
 		ConstantVector::VerifyVectorType<T>(vector);
+		WidenFor(vector);
 		return GetDataMutableUnsafe<T>(vector);
 	}
 	static inline idx_t GetCapacity(const Vector &vector) {

@@ -8,12 +8,48 @@ void ForVector::Create(Vector &vector, PhysicalType stored_type, uint64_t max_st
 	auto &buffer = vector.BufferMutable();
 	D_ASSERT(buffer.GetData());
 	D_ASSERT(buffer.cache_owned); // in-place widening needs the full-stride allocation
-	// the size has to be right before the flag goes on: a widen reads it to know how much payload there is
-	buffer.SetVectorSize(count);
+	buffer.for_count = count;
 	buffer.SetVectorTypeOnly(VectorType::FOR_VECTOR);
 	buffer.for_stored_type = stored_type;
 	buffer.for_max = max_stored;
 	buffer.for_active = false; // spent on producing; an exploit site refills it
+}
+
+bool ForVector::TryStoredConstant(const Vector &vector, const Value &constant, uint64_t &result) {
+	int64_t value;
+	switch (vector.GetType().InternalType()) {
+	case PhysicalType::INT16:
+		value = constant.GetValueUnsafe<int16_t>();
+		break;
+	case PhysicalType::INT32:
+		value = constant.GetValueUnsafe<int32_t>();
+		break;
+	case PhysicalType::INT64:
+		value = constant.GetValueUnsafe<int64_t>();
+		break;
+	case PhysicalType::UINT16:
+		value = constant.GetValueUnsafe<uint16_t>();
+		break;
+	case PhysicalType::UINT32:
+		value = constant.GetValueUnsafe<uint32_t>();
+		break;
+	case PhysicalType::UINT64: {
+		const auto unsigned_value = constant.GetValueUnsafe<uint64_t>();
+		if (unsigned_value > MaxStored(vector)) {
+			return false;
+		}
+		result = unsigned_value;
+		return true;
+	}
+	default:
+		return false;
+	}
+	// the payload holds absolute values in [0, for_max], so anything outside that compares uniformly
+	if (value < 0 || static_cast<uint64_t>(value) > MaxStored(vector)) {
+		return false;
+	}
+	result = static_cast<uint64_t>(value);
+	return true;
 }
 
 //===--------------------------------------------------------------------===//
@@ -42,7 +78,7 @@ static void WidenInPlaceTo(data_ptr_t data, PhysicalType stored, idx_t count) {
 }
 
 void ForVector::WidenInPlace(const LogicalType &type, VectorBuffer &buffer) {
-	const auto count = buffer.Size();
+	const auto count = buffer.for_count;
 	const auto stored = buffer.for_stored_type;
 	auto data = buffer.GetData();
 	switch (GetTypeIdSize(type.InternalType())) {

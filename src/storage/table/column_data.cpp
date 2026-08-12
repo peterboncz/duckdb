@@ -208,8 +208,12 @@ void ColumnData::BeginScanVectorInternal(ColumnScanState &state) {
 
 idx_t ColumnData::ScanVector(ColumnScanState &state, Vector &result, idx_t remaining, ScanVectorType scan_type,
                              idx_t base_result_offset) {
-	// a nested scan reuses the result across calls, so an earlier FOR payload has to be widened, not dropped
-	ForVector::Widen(result);
+	// A payload left in a reused result has to go before a scan writes at the logical stride. Widening rather than
+	// dropping the flag is required: a scan does not always cover the whole published payload. The validity column
+	// scans into the same result vector but only touches the mask, so it must not undo what the data scan published.
+	if (type.id() != LogicalTypeId::VALIDITY) {
+		ForVector::Widen(result);
+	}
 	if (scan_type == ScanVectorType::SCAN_FLAT_VECTOR && result.GetVectorType() != VectorType::FLAT_VECTOR) {
 		throw InternalException("ScanVector called with SCAN_FLAT_VECTOR but result is not a flat vector");
 	}

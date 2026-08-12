@@ -51,6 +51,9 @@ struct ForVector {
 	static void MarkExploited(const Vector &vector) {
 		vector.GetBufferRef()->for_active = true;
 	}
+	//! Rewrite a comparison constant into the stored space. False when it falls outside the payload's range:
+	//! the comparison is then uniform, which the normal path handles just as well.
+	static bool TryStoredConstant(const Vector &vector, const Value &constant, uint64_t &result);
 	//! Widen the payload within its own allocation and turn the vector back into a flat one
 	static void WidenInPlace(const LogicalType &type, VectorBuffer &buffer);
 	//! Widen a narrow payload into a separate target, for producers that abandon FOR part-way through a vector

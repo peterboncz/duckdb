@@ -13,6 +13,7 @@
 #include "duckdb/common/types/selection_result.hpp"
 #include "duckdb/common/vector/constant_vector.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/common/vector_operations/comparison_bitmap.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -97,8 +98,22 @@ DUCKDB_AUTOVEC_TARGET inline bool SelectComparisonFromChunk(ExecuteFunctionState
 	}
 	const auto &info = fstate.cmp_info;
 	auto &col = chunk.data[info.ref->Index()]; // dense compare reads the flat input directly
-	const auto pt = col.GetType().InternalType();
-	if (col.GetVectorType() != VectorType::FLAT_VECTOR || !BitmapCmpTypeSupported(pt)) { // sliced inputs fall back
+	auto pt = col.GetType().InternalType();
+	// hook 2: a narrow payload compares in stored space, where the same kernels move fewer bytes per lane
+	uint64_t stored_constant = 0;
+	bool stored = false;
+	if (ForVector::IsFor(col)) {
+		stored = !info.ref2 && ForVector::TryStoredConstant(col, info.constant->GetValue(), stored_constant);
+		if (!stored) {
+			ForVector::Widen(col);
+		} else {
+			pt = ForVector::StoredType(col);
+		}
+	}
+	if (col.GetVectorType() != VectorType::FLAT_VECTOR && !stored) { // sliced inputs fall back
+		return false;
+	}
+	if (!BitmapCmpTypeSupported(pt)) {
 		return false;
 	}
 	optional_ptr<Vector> col2;
@@ -108,7 +123,7 @@ DUCKDB_AUTOVEC_TARGET inline bool SelectComparisonFromChunk(ExecuteFunctionState
 			return false;
 		}
 		col2 = right;
-	} else {
+	} else if (!stored) { // a stored constant has already been range-checked against the payload
 		const auto &constant = info.constant->GetValue();
 		if (constant.IsNull() || constant.type().InternalType() != pt) {
 			return false;
@@ -124,7 +139,7 @@ DUCKDB_AUTOVEC_TARGET inline bool SelectComparisonFromChunk(ExecuteFunctionState
 	}
 	SelectionResult &t = bitmap_sel ? *bitmap_sel : fstate.tmp_sel1; // true-side bitmap
 	auto t_bm = t.PrepareBitmap(span);
-	auto &lvalidity = FlatVector::Validity(col);
+	auto &lvalidity = col.Buffer().GetValidityMask();
 	const validity_t *lvalidity_data = lvalidity.CanHaveNull() ? lvalidity.GetData() : nullptr;
 	const validity_t *rvalidity_data = nullptr;
 	const_data_ptr_t rdata = nullptr;
@@ -133,11 +148,17 @@ DUCKDB_AUTOVEC_TARGET inline bool SelectComparisonFromChunk(ExecuteFunctionState
 		rvalidity_data = rvalidity.CanHaveNull() ? rvalidity.GetData() : nullptr;
 		rdata = FlatVector::GetData(*col2);
 	}
-	DispatchFlatCmpToBitmap(pt, info.op, FlatVector::GetData(col), rdata, span, lvalidity_data, rvalidity_data, t_bm,
-	                        [&](auto tag) {
+	DispatchFlatCmpToBitmap(pt, info.op, FlatVector::GetDataUnsafe(col), rdata, span, lvalidity_data, rvalidity_data,
+	                        t_bm, [&](auto tag) {
 		                        using T = decltype(tag);
+		                        if (stored) {
+			                        return static_cast<T>(stored_constant);
+		                        }
 		                        return col2 ? T(0) : info.constant->GetValue().GetValueUnsafe<T>();
 	                        });
+	if (stored) {
+		ForVector::MarkExploited(col); // the narrow compare paid off: let the producer keep emitting FOR
+	}
 	if (have_sel) { // AND input selection into the comparison bitmap
 		fstate.tmp_sel2.Initialize(*sel);
 		fstate.tmp_sel2.ToBitmap(count, span);

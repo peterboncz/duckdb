@@ -153,10 +153,13 @@ public:
 	//! Inline FOR state: only meaningful while the vector type is FOR_VECTOR
 	PhysicalType for_stored_type = PhysicalType::INVALID;
 	uint64_t for_max = 0;
+	//! Rows of narrow payload. Kept separately from the vector size, which callers own and read.
+	idx_t for_count = 0;
 	//! True when a VectorCache owns this buffer, so the payload has full stride and can be widened in place
 	bool cache_owned = false;
 	//! FOR token: a producer emits FOR only while this is set and spends it; an exploit site refills it
-	bool for_active = true;
+	//! Off until the remaining index/update-path consumers are covered: flipping this to true enables FOR production
+	bool for_active = false;
 
 public:
 	//! Returns the actual size to reserve (a power-of-two)

@@ -792,9 +792,10 @@ static void FORUnpack(idx_t stored_size, data_ptr_t dst, data_ptr_t src, idx_t c
 //! abandons FOR by widening what was written so far.
 template <class T>
 struct FORScanTarget {
-	FORScanTarget(BitpackingScanState<T> &scan_state_p, Vector &result_p, idx_t result_offset, idx_t scan_count)
+	FORScanTarget(BitpackingScanState<T> &scan_state_p, Vector &result_p, idx_t result_offset, idx_t scan_count,
+	              bool allow_for)
 	    : scan_state(scan_state_p), result(result_p) {
-		active = result_offset == 0 && sizeof(T) > 1 && CpuBenefitsFromAutoVec() &&
+		active = allow_for && result_offset == 0 && sizeof(T) > 1 && CpuBenefitsFromAutoVec() &&
 		         scan_count <= STANDARD_VECTOR_SIZE && result.GetBufferRef()->cache_owned &&
 		         ForVector::TokenSet(result);
 	}
@@ -850,15 +851,15 @@ struct FORScanTarget {
 };
 
 template <class T, class T_S = typename MakeSigned<T>::type, class T_U = typename MakeUnsigned<T>::type>
-void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result,
-                           idx_t result_offset) {
+void BitpackingScanImpl(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result,
+                        idx_t result_offset, bool allow_for) {
 	auto &scan_state = state.scan_state->Cast<BitpackingScanState<T>>();
 
 	ForVector::Widen(result); // a payload left in a reused result must go before we write at the logical stride
 
 	T *result_data = FlatVector::GetDataMutable<T>(result);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	FORScanTarget<T> for_target(scan_state, result, result_offset, scan_count);
+	FORScanTarget<T> for_target(scan_state, result, result_offset, scan_count, allow_for);
 	auto payload = data_ptr_cast(result_data);
 
 	//! Because FOR offsets all our values to be 0 or above, we can always skip sign extension here
@@ -955,8 +956,16 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 }
 
 template <class T>
+void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result,
+                           idx_t result_offset) {
+	// a partial scan reuses the result across segments and serves fetch, checkpoint and nested scans, none of which
+	// a narrow payload survives: only the entire-vector streaming scan below may publish FOR
+	BitpackingScanImpl<T>(segment, state, scan_count, result, result_offset, false);
+}
+
+template <class T>
 void BitpackingScan(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result) {
-	BitpackingScanPartial<T>(segment, state, scan_count, result, 0);
+	BitpackingScanImpl<T>(segment, state, scan_count, result, 0, true);
 }
 
 //===--------------------------------------------------------------------===//
