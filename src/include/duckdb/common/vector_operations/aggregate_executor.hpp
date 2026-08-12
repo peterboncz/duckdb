@@ -520,16 +520,29 @@ public:
 		const auto data = FlatVector::GetDataUnsafe(vector);
 		ForVector::MarkExploited(vector);
 		auto dispatch = [&](auto t) {
-			ExecuteUnaryClusteredDispatch<STATE_TYPE, INPUT_TYPE, OP>(reinterpret_cast<const decltype(t) *>(data),
-			                                                          clustered, validity, isel, cluster_iter);
+			using S = decltype(t);
+			if constexpr (HasI64HugeintSumFastPath<INPUT_TYPE, OP>::value) {
+				// values in [0, for_max]: when a full vector of them cannot overflow int64, the per-value
+				// overflow check is provably dead
+				if (!validity.CanHaveNull() && ForVector::MaxStored(vector) <= NumericLimits<int64_t>::Maximum() /
+				                                                                   (STANDARD_VECTOR_SIZE + 1)) {
+					OP::template ExecuteFlatI64HugeintSum<STATE_TYPE, S, false>(reinterpret_cast<const S *>(data),
+					                                                            clustered, isel, cluster_iter);
+					return;
+				}
+			}
+			ExecuteUnaryClusteredDispatch<STATE_TYPE, INPUT_TYPE, OP>(reinterpret_cast<const S *>(data), clustered,
+			                                                          validity, isel, cluster_iter);
 		};
 		switch (GetTypeIdSize(ForVector::StoredType(vector))) {
 		case 1:
 			return dispatch(uint8_t(0));
 		case 2:
 			return dispatch(uint16_t(0));
-		default:
+		case 4:
 			return dispatch(uint32_t(0));
+		default:
+			return dispatch(uint64_t(0));
 		}
 	}
 

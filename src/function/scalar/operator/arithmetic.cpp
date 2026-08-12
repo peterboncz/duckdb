@@ -205,8 +205,8 @@ static bool TryForArithmetic(Vector &left, Vector &right, Vector &result, idx_t 
 	// always safe, since the stats rewrite proved the full-width operation cannot overflow. No keepalive
 	// token here: the narrow result is cheaper to write than the wide one, so there is nothing to regret.
 	uint64_t bound;
-	const bool narrow =
-	    ForArithBound<OP>(l, r, bound) && bound <= NumericLimits<uint32_t>::Maximum() && buffer->cache_owned;
+	const bool bounded = ForArithBound<OP>(l, r, bound) && buffer->cache_owned;
+	const bool narrow = bounded && bound <= NumericLimits<uint32_t>::Maximum();
 	ForVector::Discard(result); // the payload is rewritten wholesale below
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	if (result.size() != count) {
@@ -225,6 +225,11 @@ static bool TryForArithmetic(Vector &left, Vector &right, Vector &result, idx_t 
 		});
 	} else {
 		DispatchForArith<OP, int64_t>(l, r, reinterpret_cast<int64_t *>(data), count);
+		if (bounded) {
+			// a full-width payload with a known max: widening is a no-op, and the max lets a sum skip
+			// its per-value overflow check
+			ForVector::Create(result, PhysicalType::UINT64, bound, count);
+		}
 	}
 	if (l.is_for) {
 		ForVector::MarkExploited(left);
