@@ -57,7 +57,9 @@ struct ForVector {
 		return false;
 	}
 	static void MarkExploited(const Vector &vector) {
-		vector.GetBufferRef()->for_cooldown = 0;
+		auto &buffer = *vector.GetBufferRef();
+		buffer.for_cooldown = 0;
+		buffer.for_exploited = true;
 	}
 	//! Hand a narrow payload straight to an integer downcast of the same width, with no copy. False when the cast
 	//! is not a pure reinterpretation of the payload, so the caller must run the real cast. The downcast itself

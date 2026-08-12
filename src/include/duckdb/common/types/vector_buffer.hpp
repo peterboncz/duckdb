@@ -161,6 +161,10 @@ public:
 	//! payload) sets a cooldown and an exploit site clears it, so the cost of guessing wrong is bounded to the
 	//! cooldown rather than the rest of the query.
 	uint16_t for_cooldown = 0;
+	//! Whether any consumer used this payload narrow since it was produced. A trailing widen (e.g. an
+	//! aggregate sink) after an exploit is the normal end of a useful FOR vector, not a wasted one, so
+	//! only a widen of a never-exploited payload starts the cooldown.
+	bool for_exploited = false;
 
 public:
 	//! Returns the actual size to reserve (a power-of-two)

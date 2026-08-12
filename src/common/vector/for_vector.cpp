@@ -11,6 +11,7 @@ void ForVector::Create(Vector &vector, PhysicalType stored_type, uint64_t max_st
 	buffer.SetVectorTypeOnly(VectorType::FOR_VECTOR);
 	buffer.for_stored_type = stored_type;
 	buffer.for_max = max_stored;
+	buffer.for_exploited = false;
 }
 
 bool ForVector::TryRetype(Vector &source, Vector &result, idx_t count) {
@@ -199,8 +200,10 @@ void ForVector::AlignStored(const Vector &vector, PhysicalType stored_type) {
 
 void ForVector::WidenInPlace(const LogicalType &type, VectorBuffer &buffer) {
 	WidenInPlace(buffer.GetData(), buffer.for_stored_type, type.InternalType(), buffer.for_count);
-	// nothing used the narrow payload: sit out a cooldown before producing it again
-	buffer.for_cooldown = COOLDOWN;
+	if (!buffer.for_exploited) {
+		// nothing used the narrow payload: sit out a cooldown before producing it again
+		buffer.for_cooldown = COOLDOWN;
+	}
 	buffer.SetVectorTypeOnly(VectorType::FLAT_VECTOR);
 	buffer.for_stored_type = PhysicalType::INVALID;
 }
