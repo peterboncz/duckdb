@@ -47,7 +47,18 @@ struct ForVector {
 	//! Keepalive: producers emit FOR while the token is set. A full widen spends it (nothing used the narrow
 	//! payload); an exploit site refills it.
 	static bool TokenSet(const Vector &vector) {
-		return vector.GetBufferRef()->for_active;
+		auto &buffer = *vector.GetBufferRef();
+		if (buffer.for_active) {
+			return true;
+		}
+		// periodically re-arm: the consumer mix can change, and a single widen must not be terminal
+		static constexpr uint16_t PROBE = 64;
+		if (++buffer.for_probe < PROBE) {
+			return false;
+		}
+		buffer.for_probe = 0;
+		buffer.for_active = true;
+		return true;
 	}
 	static void MarkExploited(const Vector &vector) {
 		vector.GetBufferRef()->for_active = true;
