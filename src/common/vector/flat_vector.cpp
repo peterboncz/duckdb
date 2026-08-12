@@ -6,6 +6,7 @@
 #include "duckdb/common/types/bignum.hpp"
 
 namespace duckdb {
+
 StandardVectorBuffer::StandardVectorBuffer(Allocator &allocator, capacity_t capacity_p, idx_t type_size_p)
     : VectorBuffer(VectorType::FLAT_VECTOR, VectorBufferType::STANDARD_BUFFER, count_t(0)), data_ptr(nullptr),
       type_size(type_size_p), capacity(capacity_p) {

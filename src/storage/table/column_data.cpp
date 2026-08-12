@@ -142,6 +142,9 @@ void ColumnData::InitializeScanWithOffset(ColumnScanState &state, idx_t row_idx)
 }
 
 ScanVectorType ColumnData::GetVectorScanType(ColumnScanState &state, idx_t scan_count, Vector &result) {
+	// a payload left by an earlier chunk must not read as "not flat" here: that would pick the entire-vector path
+	// for a scan that has to cross segments, and the scan would then cover only part of the vector
+	ForVector::Widen(result);
 	if (result.GetVectorType() != VectorType::FLAT_VECTOR) {
 		return ScanVectorType::SCAN_ENTIRE_VECTOR;
 	}

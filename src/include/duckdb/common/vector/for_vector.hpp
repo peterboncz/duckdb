@@ -56,9 +56,9 @@ struct ForVector {
 	static bool TryStoredConstant(const Vector &vector, const Value &constant, uint64_t &result);
 	//! Widen the payload within its own allocation and turn the vector back into a flat one
 	static void WidenInPlace(const LogicalType &type, VectorBuffer &buffer);
-	//! Widen a narrow payload into a separate target, for producers that abandon FOR part-way through a vector
-	static void WidenPayload(const_data_ptr_t src, PhysicalType stored, data_ptr_t target, PhysicalType target_type,
-	                         idx_t count);
+	//! Widen a narrow payload where it lies. Always in place: a producer abandoning FOR part-way through a vector
+	//! has its source and target in the same bytes, so this must never be a forward copy.
+	static void WidenInPlace(data_ptr_t data, PhysicalType stored, PhysicalType target_type, idx_t count);
 };
 
 } // namespace duckdb

@@ -1,5 +1,7 @@
 #include "duckdb/common/types/vector_cache.hpp"
 
+#include "duckdb/common/vector/for_vector.hpp"
+
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector/array_vector.hpp"
@@ -54,6 +56,10 @@ public:
 		buffer->ClearAuxiliaryData();
 		result.SetBuffer(buffer_ptr<VectorBuffer>(buffer));
 		result.BufferMutable().ResetCapacity(capacity);
+		if (result.BufferMutable().GetVectorType() == VectorType::FOR_VECTOR) {
+			// clearing the flag without widening would leave narrow bytes behind that read as the logical width
+			ForVector::WidenInPlace(type, result.BufferMutable());
+		}
 		result.BufferMutable().SetVectorTypeOnly(VectorType::FLAT_VECTOR);
 		result.BufferMutable().cache_owned = false;
 		switch (internal_type) {

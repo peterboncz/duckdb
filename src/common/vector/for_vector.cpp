@@ -77,57 +77,21 @@ static void WidenInPlaceTo(data_ptr_t data, PhysicalType stored, idx_t count) {
 	}
 }
 
-void ForVector::WidenInPlace(const LogicalType &type, VectorBuffer &buffer) {
-	const auto count = buffer.for_count;
-	const auto stored = buffer.for_stored_type;
-	auto data = buffer.GetData();
-	switch (GetTypeIdSize(type.InternalType())) {
-	case 2:
-		WidenInPlaceTo<uint16_t>(data, stored, count);
-		break;
-	case 4:
-		WidenInPlaceTo<uint32_t>(data, stored, count);
-		break;
-	default:
-		WidenInPlaceTo<uint64_t>(data, stored, count);
-		break;
-	}
-	buffer.SetVectorTypeOnly(VectorType::FLAT_VECTOR);
-	buffer.for_stored_type = PhysicalType::INVALID;
-}
-
-template <class SRC, class DST>
-DUCKDB_AUTOVEC_TARGET static void WidenLoop(const SRC *DUCKDB_BITPACKING_RESTRICT src,
-                                            DST *DUCKDB_BITPACKING_RESTRICT target, idx_t count) {
-	DUCKDB_UNROLL_LOOP
-	for (idx_t i = 0; i < count; i++) {
-		target[i] = static_cast<DST>(src[i]);
-	}
-}
-
-template <class DST>
-static void WidenToTarget(const_data_ptr_t src, PhysicalType stored, data_ptr_t target, idx_t count) {
-	auto dst = reinterpret_cast<DST *>(target);
-	switch (GetTypeIdSize(stored)) {
-	case 1:
-		return WidenLoop<uint8_t, DST>(reinterpret_cast<const uint8_t *>(src), dst, count);
-	case 2:
-		return WidenLoop<uint16_t, DST>(reinterpret_cast<const uint16_t *>(src), dst, count);
-	default:
-		return WidenLoop<uint32_t, DST>(reinterpret_cast<const uint32_t *>(src), dst, count);
-	}
-}
-
-void ForVector::WidenPayload(const_data_ptr_t src, PhysicalType stored, data_ptr_t target, PhysicalType target_type,
-                             idx_t count) {
+void ForVector::WidenInPlace(data_ptr_t data, PhysicalType stored, PhysicalType target_type, idx_t count) {
 	switch (GetTypeIdSize(target_type)) {
 	case 2:
-		return WidenToTarget<uint16_t>(src, stored, target, count);
+		return WidenInPlaceTo<uint16_t>(data, stored, count);
 	case 4:
-		return WidenToTarget<uint32_t>(src, stored, target, count);
+		return WidenInPlaceTo<uint32_t>(data, stored, count);
 	default:
-		return WidenToTarget<uint64_t>(src, stored, target, count);
+		return WidenInPlaceTo<uint64_t>(data, stored, count);
 	}
+}
+
+void ForVector::WidenInPlace(const LogicalType &type, VectorBuffer &buffer) {
+	WidenInPlace(buffer.GetData(), buffer.for_stored_type, type.InternalType(), buffer.for_count);
+	buffer.SetVectorTypeOnly(VectorType::FLAT_VECTOR);
+	buffer.for_stored_type = PhysicalType::INVALID;
 }
 
 } // namespace duckdb

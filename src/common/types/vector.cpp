@@ -897,6 +897,8 @@ void Vector::SetVectorType(VectorType new_vector_type) {
 	if (new_vector_type != VectorType::FLAT_VECTOR && new_vector_type != VectorType::CONSTANT_VECTOR) {
 		throw InternalException("SetVectorType can only be used with FLAT / CONSTANT vectors");
 	}
+	// dropping the FOR flag has to widen: otherwise the payload stays narrow but reads at the logical stride
+	ForVector::Widen(*this);
 	if (buffer) {
 		// FIXME: should we allow vectors without a buffer?
 		BufferMutable().SetVectorType(new_vector_type);

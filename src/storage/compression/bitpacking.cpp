@@ -801,9 +801,12 @@ struct FORScanTarget {
 	}
 
 	//! Can this group's run join the narrow payload? Fixes the stored width on the first accepted group.
-	bool Accept(idx_t offset_in_compression_group) {
+	bool Accept(idx_t offset_in_compression_group, idx_t remaining) {
 		if (!active || offset_in_compression_group != 0) {
 			return false; // mid-algorithm-group runs would need a scratch decode: not worth the code
+		}
+		if (remaining % BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE != 0) {
+			return false; // the unpack kernel only decodes whole algorithm groups; a partial tail needs the scratch path
 		}
 		const auto size = FORStoredSize<T>(scan_state.current_frame_of_reference, scan_state.current_width);
 		if (size == 0 || (stored_size != 0 && size != stored_size)) {
@@ -825,7 +828,7 @@ struct FORScanTarget {
 	//! Give up on FOR: widen everything written so far in place and stop trying
 	void Abandon(data_ptr_t payload, idx_t written) {
 		if (stored_size != 0) {
-			ForVector::WidenPayload(payload, StoredPhysicalType(), payload, GetTypeId<T>(), written);
+			ForVector::WidenInPlace(payload, StoredPhysicalType(), GetTypeId<T>(), written);
 			stored_size = 0;
 		}
 		active = false;
@@ -913,7 +916,7 @@ void BitpackingScanImpl(ColumnSegment &segment, ColumnScanState &state, idx_t sc
 		    MinValue<idx_t>(scan_count - scanned, BITPACKING_METADATA_GROUP_SIZE - scan_state.current_group_offset);
 		idx_t to_scan = remaining - (remaining % BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE);
 		if (scan_state.current_group.mode == BitpackingMode::FOR && remaining > 0 &&
-		    for_target.Accept(offset_in_compression_group)) {
+		    for_target.Accept(offset_in_compression_group, remaining)) {
 			// hook 1: the narrow payload goes downstream instead of being widened here
 			for_target.Decode(payload, scanned, remaining);
 			scanned += remaining;

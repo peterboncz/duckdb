@@ -158,8 +158,7 @@ public:
 	//! True when a VectorCache owns this buffer, so the payload has full stride and can be widened in place
 	bool cache_owned = false;
 	//! FOR token: a producer emits FOR only while this is set and spends it; an exploit site refills it
-	//! Off until the remaining index/update-path consumers are covered: flipping this to true enables FOR production
-	bool for_active = false;
+	bool for_active = true;
 
 public:
 	//! Returns the actual size to reserve (a power-of-two)
