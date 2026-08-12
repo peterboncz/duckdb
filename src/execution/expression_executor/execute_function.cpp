@@ -236,25 +236,48 @@ bool ExecuteFunctionState::TryForArithmetic(DataChunk &input, Vector &result, id
 		}
 		break;
 	}
-	// the kernel width must hold the bound, the constants, and both payloads as they are stored
+	// each side loads at its own width; the result width must hold the bound and the constants
 	const uint64_t need = MaxValue(bound, MaxValue(side_max[0], side_max[1]));
-	idx_t width = need <= 0xFF ? 1 : need <= 0xFFFF ? 2 : need <= 0xFFFFFFFF ? 4 : 8;
-	for (idx_t i = 0; i < 2; i++) {
-		if (is_for[i]) {
-			width = MaxValue<idx_t>(width, GetTypeIdSize(ForVector::StoredType(input.data[i])));
-		}
+	const idx_t res_width = need <= 0xFF ? 1 : need <= 0xFFFF ? 2 : need <= 0xFFFFFFFF ? 4 : 8;
+	// a result at the logical width is still worth it when a mixed kernel can load the inputs narrow,
+	// but then it is a plain wide vector, not a FOR one
+	const bool wide_result = res_width >= GetTypeIdSize(wide);
+	if (wide_result && wide != PhysicalType::INT64) {
+		return false; // the mixed kernels only produce wide results at int64
 	}
-	if (width >= GetTypeIdSize(wide) || !result.GetBufferRef() || !result.GetBufferRef()->cache_owned) {
+	if (!wide_result && (!result.GetBufferRef() || !result.GetBufferRef()->cache_owned)) {
 		return false;
 	}
-	const auto stored = width == 1 ? PhysicalType::UINT8 : (width == 2 ? PhysicalType::UINT16 : PhysicalType::UINT32);
-	if (stored != for_width) { // the narrow twins are rebuilt only when the stored width changes
-		const auto ntype =
-		    width == 1 ? LogicalType::UTINYINT : (width == 2 ? LogicalType::USMALLINT : LogicalType::UINTEGER);
+	auto ntype = [](uint64_t lim) {
+		return lim <= 0xFF ? PhysicalType::UINT8 : lim <= 0xFFFF ? PhysicalType::UINT16 : PhysicalType::UINT32;
+	};
+	auto ltype = [](PhysicalType t) {
+		return LogicalType(t == PhysicalType::UINT8    ? LogicalTypeId::UTINYINT
+		                   : t == PhysicalType::UINT16 ? LogicalTypeId::USMALLINT
+		                                               : LogicalTypeId::UINTEGER);
+	};
+	// a FOR side is read at its stored width; a constant side presents at its own minimal width for free
+	PhysicalType side_type[2];
+	for (idx_t i = 0; i < 2; i++) {
+		side_type[i] = is_for[i] ? ForVector::StoredType(input.data[i]) : ntype(side_max[i]);
+	}
+	// a narrow result must hold the bound and both sides as stored
+	const auto res_type =
+	    wide_result ? wide
+	                : ntype(MaxValue(need, MaxValue<uint64_t>((uint64_t(1) << (GetTypeIdSize(side_type[0]) * 8)) - 1,
+	                                                          (uint64_t(1) << (GetTypeIdSize(side_type[1]) * 8)) - 1)));
+	auto fn = GetForArithmeticFunction(arith_op, side_type[0], side_type[1], res_type);
+	if (!fn) {
+		// no kernel for this triple: align both sides to the result width and take the same-width one
+		side_type[0] = side_type[1] = res_type;
+		fn = GetForArithmeticFunction(arith_op, res_type);
+	}
+	if (side_type[0] != for_width || side_type[1] != for_width_r) { // twins rebuilt only when the widths change
 		for_chunk.data.clear();
-		for_chunk.InitializeEmpty({ntype, ntype});
-		for_result = make_uniq<Vector>(ntype, nullptr);
-		for_width = stored;
+		for_chunk.InitializeEmpty({ltype(side_type[0]), ltype(side_type[1])});
+		for_result = make_uniq<Vector>(ltype(res_type), nullptr);
+		for_width = side_type[0];
+		for_width_r = side_type[1];
 	}
 	// the twins share the payload buffers; the FOR flags drop for the duration of the call so the plain flat
 	// kernel sees plain flat vectors, and come back with the derived bounds afterwards
@@ -262,7 +285,7 @@ bool ExecuteFunctionState::TryForArithmetic(DataChunk &input, Vector &result, id
 	for (idx_t i = 0; i < 2; i++) {
 		auto &side = input.data[i];
 		if (is_for[i]) {
-			ForVector::AlignStored(side, stored);
+			ForVector::AlignStored(side, side_type[i]);
 			payload_rows[i] = side.GetBufferRef()->for_count;
 			ForVector::Discard(side);
 		}
@@ -270,12 +293,16 @@ bool ExecuteFunctionState::TryForArithmetic(DataChunk &input, Vector &result, id
 	}
 	for_chunk.SetCardinality(count);
 	ForVector::Discard(result); // any stale payload is fully overwritten
-	for_result->Reinterpret(result);
-	GetForArithmeticFunction(arith_op, stored)(for_chunk, *this, *for_result);
-	ForVector::Create(result, stored, bound, count);
+	if (wide_result) {
+		fn(for_chunk, *this, result); // the result is genuinely wide: only the loads run narrow
+	} else {
+		for_result->Reinterpret(result);
+		fn(for_chunk, *this, *for_result);
+		ForVector::Create(result, res_type, bound, count);
+	}
 	for (idx_t i = 0; i < 2; i++) {
 		if (is_for[i]) {
-			ForVector::Create(input.data[i], stored, side_max[i], payload_rows[i]);
+			ForVector::Create(input.data[i], side_type[i], side_max[i], payload_rows[i]);
 			ForVector::MarkExploited(input.data[i]);
 		}
 	}

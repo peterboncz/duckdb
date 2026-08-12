@@ -71,6 +71,35 @@ static scalar_function_t GetScalarIntegerFunction(PhysicalType type) {
 	return function;
 }
 
+//! Payloads keep their own widths: each side is read at its stored type, the result written at res. The narrow
+//! triples put the result at the wider input; the int64 triples serve a result that is genuinely wide - its
+//! inputs still load narrow, which is where the win is. Returns nullptr for a pair with no kernel.
+template <class OP>
+static scalar_function_t GetMixedIntegerFunction(PhysicalType left, PhysicalType right, PhysicalType res) {
+#define DUCKDB_MIXED_ARITH_TRIPLE(TL, TR_, TRES)                                                                       \
+	if (left == GetTypeId<TL>() && right == GetTypeId<TR_>() && res == GetTypeId<TRES>()) {                            \
+		scalar_function_t fn = &ScalarFunction::BinaryFunction<TL, TR_, TRES, OP>;                                     \
+		return fn;                                                                                                     \
+	}
+	DUCKDB_MIXED_ARITH_TRIPLE(uint16_t, uint8_t, uint16_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint8_t, uint16_t, uint16_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint32_t, uint8_t, uint32_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint8_t, uint32_t, uint32_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint32_t, uint16_t, uint32_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint16_t, uint32_t, uint32_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint8_t, uint8_t, int64_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint16_t, uint8_t, int64_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint8_t, uint16_t, int64_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint16_t, uint16_t, int64_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint32_t, uint8_t, int64_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint8_t, uint32_t, int64_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint32_t, uint16_t, int64_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint16_t, uint32_t, int64_t)
+	DUCKDB_MIXED_ARITH_TRIPLE(uint32_t, uint32_t, int64_t)
+#undef DUCKDB_MIXED_ARITH_TRIPLE
+	return nullptr;
+}
+
 //! Hook 3: the same operation one width down. The FOR bound proof rules out overflow, so the plain kernels are exact.
 scalar_function_t GetForArithmeticFunction(char op, PhysicalType type) {
 	switch (op) {
@@ -80,6 +109,20 @@ scalar_function_t GetForArithmeticFunction(char op, PhysicalType type) {
 		return GetScalarIntegerFunction<SubtractOperator>(type);
 	default:
 		return GetScalarIntegerFunction<MultiplyOperator>(type);
+	}
+}
+
+scalar_function_t GetForArithmeticFunction(char op, PhysicalType left, PhysicalType right, PhysicalType res) {
+	if (left == right && right == res) {
+		return GetForArithmeticFunction(op, res);
+	}
+	switch (op) {
+	case '+':
+		return GetMixedIntegerFunction<AddOperator>(left, right, res);
+	case '-':
+		return GetMixedIntegerFunction<SubtractOperator>(left, right, res);
+	default:
+		return GetMixedIntegerFunction<MultiplyOperator>(left, right, res);
 	}
 }
 

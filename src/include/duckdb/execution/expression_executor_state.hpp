@@ -95,8 +95,9 @@ private:
 	bool safe_autovec_arith = false;
 	//! The operator char (+,-,*) when safe_autovec_arith, so hook 3 can pick the narrow twin of the kernel
 	char arith_op = 0;
-	//! Narrow-typed twins of dictionary_input_chunk and the result; rebuilt only when the stored width changes
+	//! Narrow-typed twins of dictionary_input_chunk and the result; rebuilt only when the stored widths change
 	PhysicalType for_width = PhysicalType::INVALID;
+	PhysicalType for_width_r = PhysicalType::INVALID;
 	DataChunk for_chunk;
 	unique_ptr<Vector> for_result;
 	//! The column index of the "unary" input column that may be a dictionary vector
