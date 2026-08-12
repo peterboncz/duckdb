@@ -21,15 +21,6 @@ struct ForVector {
 	}
 	//! Mark a flat vector as FOR: its buffer already holds the narrow payload for the first count rows
 	static void Create(Vector &vector, PhysicalType stored_type, uint64_t max_stored, idx_t count);
-	//! Drop the FOR flag without widening, for a producer that is about to overwrite the whole payload.
-	//! Does not refill the token: only a consumer that exploited the narrow payload earns another FOR vector.
-	static void Reset(Vector &vector) {
-		if (IsFor(vector)) {
-			auto &buffer = vector.BufferMutable();
-			buffer.SetVectorTypeOnly(VectorType::FLAT_VECTOR);
-			buffer.for_stored_type = PhysicalType::INVALID;
-		}
-	}
 	//! Safety net for FOR-unaware code: widen back to the logical width. Free - the payload is widened in place.
 	static void Widen(const Vector &vector) {
 		if (IsFor(vector)) {

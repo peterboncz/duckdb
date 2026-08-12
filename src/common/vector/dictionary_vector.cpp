@@ -1,4 +1,6 @@
 #include "duckdb/common/vector/dictionary_vector.hpp"
+
+#include "duckdb/common/vector/for_vector.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -140,6 +142,8 @@ Value DictionaryBuffer::GetValue(const LogicalType &type, idx_t index) const {
 
 buffer_ptr<VectorBuffer> DictionaryBuffer::Flatten(const LogicalType &type) const {
 	// flatten the child based on the selection vector stored in the dictionary
+	// this goes straight to the child's buffer, so a narrow payload has to be widened here
+	ForVector::Widen(entry->data);
 	return entry->data.Buffer().FlattenSlice(type, sel_vector, Size());
 }
 
@@ -160,6 +164,7 @@ buffer_ptr<VectorBuffer> DictionaryBuffer::FlattenSliceInternal(const LogicalTyp
 	auto &sel = sel_ref.get();
 
 	// flatten the child using the selection vector
+	ForVector::Widen(entry->data);
 	return entry->data.BufferMutable().FlattenSlice(type, sel, count);
 }
 
