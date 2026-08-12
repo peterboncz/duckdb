@@ -218,7 +218,7 @@ idx_t ColumnData::ScanVector(ColumnScanState &state, Vector &result, idx_t remai
 	if (type.id() != LogicalTypeId::VALIDITY) {
 		// this scan is about to rewrite the payload, so widening it first is wasted work
 		if (base_result_offset == 0) {
-			ForVector::Discard(result, remaining);
+			ForVector::Discard(result);
 		} else {
 			ForVector::Widen(result);
 		}

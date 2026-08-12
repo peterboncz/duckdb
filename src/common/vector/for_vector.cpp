@@ -11,7 +11,6 @@ void ForVector::Create(Vector &vector, PhysicalType stored_type, uint64_t max_st
 	buffer.SetVectorTypeOnly(VectorType::FOR_VECTOR);
 	buffer.for_stored_type = stored_type;
 	buffer.for_max = max_stored;
-	buffer.for_active = false; // spent on producing; an exploit site refills it
 }
 
 bool ForVector::TryRetype(Vector &source, Vector &result, idx_t count) {
@@ -50,6 +49,24 @@ bool ForVector::TryRetype(Vector &source, Vector &result, idx_t count) {
 	return true;
 }
 
+//! A constant above the payload's ceiling makes every comparison uniform, and replacing it with for_max + 1 gives
+//! that same answer through the ordinary kernel: no value can equal or exceed it, and every value is below it.
+//! So the comparison stays a narrow one instead of widening the payload to reach a foregone conclusion.
+static bool ClampStoredConstant(const Vector &vector, uint64_t &value) {
+	const auto max_stored = ForVector::MaxStored(vector);
+	if (value <= max_stored) {
+		return true;
+	}
+	const auto stored_size = GetTypeIdSize(ForVector::StoredType(vector));
+	const uint64_t stored_max = stored_size == 8 ? NumericLimits<uint64_t>::Maximum()
+	                                            : ((uint64_t(1) << (stored_size * 8)) - 1);
+	if (max_stored >= stored_max) {
+		return false; // no headroom for the sentinel
+	}
+	value = max_stored + 1;
+	return true;
+}
+
 bool ForVector::TryStoredConstant(const Vector &vector, const Value &constant, uint64_t &result) {
 	int64_t value;
 	switch (vector.GetType().InternalType()) {
@@ -68,23 +85,17 @@ bool ForVector::TryStoredConstant(const Vector &vector, const Value &constant, u
 	case PhysicalType::UINT32:
 		value = constant.GetValueUnsafe<uint32_t>();
 		break;
-	case PhysicalType::UINT64: {
-		const auto unsigned_value = constant.GetValueUnsafe<uint64_t>();
-		if (unsigned_value > MaxStored(vector)) {
-			return false;
-		}
-		result = unsigned_value;
-		return true;
-	}
+	case PhysicalType::UINT64:
+		result = constant.GetValueUnsafe<uint64_t>();
+		return ClampStoredConstant(vector, result);
 	default:
 		return false;
 	}
-	// the payload holds absolute values in [0, for_max], so anything outside that compares uniformly
-	if (value < 0 || static_cast<uint64_t>(value) > MaxStored(vector)) {
-		return false;
+	if (value < 0) {
+		return false; // no unsigned stored constant expresses "below every value"
 	}
 	result = static_cast<uint64_t>(value);
-	return true;
+	return ClampStoredConstant(vector, result);
 }
 
 //===--------------------------------------------------------------------===//
@@ -160,6 +171,9 @@ void ForVector::WidenGather(const_data_ptr_t src, PhysicalType stored, data_ptr_
 
 void ForVector::WidenInPlace(const LogicalType &type, VectorBuffer &buffer) {
 	WidenInPlace(buffer.GetData(), buffer.for_stored_type, type.InternalType(), buffer.for_count);
+	// a full widen means nothing used the narrow payload. Spending the token here rather than at publish keeps a
+	// single unexploited vector from disabling FOR for the column permanently.
+	buffer.for_active = false;
 	buffer.SetVectorTypeOnly(VectorType::FLAT_VECTOR);
 	buffer.for_stored_type = PhysicalType::INVALID;
 }

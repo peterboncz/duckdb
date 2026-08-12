@@ -21,18 +21,13 @@ struct ForVector {
 	}
 	//! Mark a flat vector as FOR: its buffer already holds the narrow payload for the first count rows
 	static void Create(Vector &vector, PhysicalType stored_type, uint64_t max_stored, idx_t count);
-	//! A producer about to overwrite the whole payload can drop the flag instead of widening it. Only safe when
-	//! the writer covers every published row: rows past the new size keep narrow bytes, which is fine because
-	//! nothing reads past the vector size, but a partial overwrite would leave a narrow hole inside it.
-	static void Discard(Vector &vector, idx_t rows_to_write) {
+	//! A producer about to rewrite the payload drops the flag rather than widening it: it sets the size to what it
+	//! writes, so no reader can see a stale row. This is scan bookkeeping, so it must not spend the token.
+	static void Discard(Vector &vector) {
 		if (!IsFor(vector)) {
 			return;
 		}
 		auto &buffer = vector.BufferMutable();
-		if (rows_to_write < buffer.for_count) {
-			Widen(vector);
-			return;
-		}
 		buffer.SetVectorTypeOnly(VectorType::FLAT_VECTOR);
 		buffer.for_stored_type = PhysicalType::INVALID;
 	}
@@ -49,8 +44,8 @@ struct ForVector {
 	static uint64_t MaxStored(const Vector &vector) {
 		return vector.GetBufferRef()->for_max;
 	}
-	//! Keepalive: producers only emit FOR while the token is set, and spend it on producing.
-	//! A consumer that exploited the narrow payload refills it.
+	//! Keepalive: producers emit FOR while the token is set. A full widen spends it (nothing used the narrow
+	//! payload); an exploit site refills it.
 	static bool TokenSet(const Vector &vector) {
 		return vector.GetBufferRef()->for_active;
 	}
