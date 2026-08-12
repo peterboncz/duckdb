@@ -790,7 +790,7 @@ static void FORUnpack(idx_t stored_size, data_ptr_t dst, data_ptr_t src, idx_t c
 //! Hook 1 state: accumulates a narrow payload across metadata groups, straight into the result's own buffer.
 //! Groups usually agree on the stored width, so the common case stays narrow; a group that does not fit
 //! abandons FOR by widening what was written so far.
-template <class T>
+template <class T, class T_S = typename MakeSigned<T>::type>
 struct FORScanTarget {
 	FORScanTarget(BitpackingScanState<T> &scan_state_p, Vector &result_p, idx_t result_offset, idx_t scan_count,
 	              bool allow_for)
@@ -823,6 +823,51 @@ struct FORScanTarget {
 		auto src = scan_state.current_group_ptr + scan_state.current_group_offset * scan_state.current_width / 8;
 		FORUnpack(stored_size, payload + written * stored_size, src, count, scan_state.current_width,
 		          static_cast<uint64_t>(scan_state.current_frame_of_reference));
+	}
+
+	//! A delta group only narrows to 4 bytes: that is the width with a SIMD prefix sum, and the only one whose
+	//! ceiling is loose enough for a running sum. The bound has to cover the cumulative sum over the rest of the
+	//! metadata group, since every later value in the group builds on this one.
+	bool AcceptDelta(idx_t offset_in_compression_group, idx_t remaining) {
+		// exactly 8 bytes: 16-byte payloads use a different packing layout, and 4 bytes has nothing to narrow to
+		if (!active || offset_in_compression_group != 0 || sizeof(T) != 8) {
+			return false;
+		}
+		if (remaining % BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE != 0) {
+			return false;
+		}
+		if (stored_size != 0 && stored_size != 4) {
+			return false; // cannot join a payload already fixed at a different width
+		}
+		const auto base = static_cast<T_S>(scan_state.current_delta_offset);
+		const auto frame = static_cast<T_S>(scan_state.current_frame_of_reference);
+		if (base < 0 || frame < 0 || scan_state.current_width >= 32) {
+			return false;
+		}
+		const auto horizon =
+		    static_cast<T_S>(BITPACKING_METADATA_GROUP_SIZE - scan_state.current_group_offset);
+		T_S max_delta, span, upper;
+		if (!TryAddOperator::Operation(frame, static_cast<T_S>((uint64_t(1) << scan_state.current_width) - 1),
+		                               max_delta) ||
+		    !TryMultiplyOperator::Operation(horizon, max_delta, span) ||
+		    !TryAddOperator::Operation(base, span, upper) ||
+		    upper > static_cast<T_S>(NumericLimits<uint32_t>::Maximum())) {
+			return false;
+		}
+		stored_size = 4;
+		return true;
+	}
+
+	//! Unpack at 4 bytes and run the prefix sum there. Values are non-decreasing (frame >= 0), so the last
+	//! one is the group's maximum.
+	void DecodeDelta(data_ptr_t payload, idx_t written, idx_t count) {
+		auto src = scan_state.current_group_ptr + scan_state.current_group_offset * scan_state.current_width / 8;
+		auto dst = reinterpret_cast<uint32_t *>(payload + written * stored_size);
+		BitpackingPrimitives::UnPackBuffer<uint32_t>(data_ptr_cast(dst), src, count, scan_state.current_width, true,
+		                                             static_cast<uint32_t>(scan_state.current_frame_of_reference));
+		const auto last = DeltaDecode<uint32_t>(dst, static_cast<uint32_t>(scan_state.current_delta_offset), count);
+		scan_state.current_delta_offset = static_cast<T>(last);
+		max_stored = MaxValue<uint64_t>(max_stored, last);
 	}
 
 	//! Give up on FOR: widen everything written so far in place and stop trying
@@ -862,7 +907,7 @@ void BitpackingScanImpl(ColumnSegment &segment, ColumnScanState &state, idx_t sc
 
 	T *result_data = FlatVector::GetDataMutable<T>(result);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	FORScanTarget<T> for_target(scan_state, result, result_offset, scan_count, allow_for);
+	FORScanTarget<T, T_S> for_target(scan_state, result, result_offset, scan_count, allow_for);
 	auto payload = data_ptr_cast(result_data);
 
 	//! Because FOR offsets all our values to be 0 or above, we can always skip sign extension here
@@ -915,13 +960,22 @@ void BitpackingScanImpl(ColumnSegment &segment, ColumnScanState &state, idx_t sc
 		auto remaining =
 		    MinValue<idx_t>(scan_count - scanned, BITPACKING_METADATA_GROUP_SIZE - scan_state.current_group_offset);
 		idx_t to_scan = remaining - (remaining % BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE);
-		if (scan_state.current_group.mode == BitpackingMode::FOR && remaining > 0 &&
-		    for_target.Accept(offset_in_compression_group, remaining)) {
+		if (remaining > 0) {
 			// hook 1: the narrow payload goes downstream instead of being widened here
-			for_target.Decode(payload, scanned, remaining);
-			scanned += remaining;
-			scan_state.current_group_offset += remaining;
-			continue;
+			if (scan_state.current_group.mode == BitpackingMode::FOR &&
+			    for_target.Accept(offset_in_compression_group, remaining)) {
+				for_target.Decode(payload, scanned, remaining);
+				scanned += remaining;
+				scan_state.current_group_offset += remaining;
+				continue;
+			}
+			if (scan_state.current_group.mode == BitpackingMode::DELTA_FOR &&
+			    for_target.AcceptDelta(offset_in_compression_group, remaining)) {
+				for_target.DecodeDelta(payload, scanned, remaining);
+				scanned += remaining;
+				scan_state.current_group_offset += remaining;
+				continue;
+			}
 		}
 		for_target.Abandon(payload, scanned);
 		if (offset_in_compression_group == 0 && to_scan > 0) {
