@@ -172,8 +172,11 @@ public:
 			case 2:
 				found = probe(uint16_t(0));
 				return true;
-			default:
+			case 4:
 				found = probe(uint32_t(0));
+				return true;
+			default:
+				found = probe(uint64_t(0));
 				return true;
 			}
 		}

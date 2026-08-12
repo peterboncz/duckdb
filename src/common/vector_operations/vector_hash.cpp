@@ -334,11 +334,15 @@ bool TryHashFor(const Vector &input, Vector &result, const SelectionVector *rsel
 	case 2:
 		hash_at(uint16_t(0));
 		break;
-	default:
+	case 4:
 		hash_at(uint32_t(0));
 		break;
+	default:
+		hash_at(uint64_t(0));
+		break;
 	}
-	ForVector::MarkExploited(*payload);
+	// no exploit mark: a hash reads the payload once and saves little, and a join key hashed narrow is
+	// usually widened right after for the row match - the widen's cooldown must stay in charge
 	return true;
 }
 
