@@ -198,15 +198,34 @@ buffer_ptr<VectorBuffer> StandardVectorBuffer::Flatten(const LogicalType &type) 
 
 buffer_ptr<VectorBuffer> StandardVectorBuffer::FlattenSliceInternal(const LogicalType &type, const SelectionVector &sel,
                                                                     idx_t count) const {
-	// allocate the new buffer
 	auto allocated_count = MaxValue<idx_t>(STANDARD_VECTOR_SIZE, count);
+	if (vector_type == VectorType::FOR_VECTOR && count <= STANDARD_VECTOR_SIZE) {
+		// gather straight out of the narrow payload: only the selected rows get widened. The gather runs once per
+		// vector, so its target is a slot reused across chunks rather than a fresh allocation.
+		for (idx_t k = 0; k < 2; k++) {
+			auto &slot = widen_slots[widen_slot];
+			widen_slot ^= 1;
+			if (slot && slot.use_count() != 1) {
+				continue; // a downstream vector still reads this slot
+			}
+			if (!slot) {
+				slot = make_buffer<StandardVectorBuffer>(capacity_t(STANDARD_VECTOR_SIZE),
+				                                         GetTypeIdSize(type.InternalType()));
+			}
+			ForVector::WidenGather(data_ptr, for_stored_type, slot->GetData(), type.InternalType(), sel, count);
+			slot->SetVectorSizeOnly(count);
+			slot->GetValidityMask().Reset(STANDARD_VECTOR_SIZE);
+			slot->GetValidityMask().CopySel(validity, sel, 0, 0, count);
+			return slot;
+		}
+	}
+	// allocate the new buffer
 	auto target_byte_count = allocated_count * type_size;
 	auto stored_allocator = GetAllocator();
 	auto &allocator = stored_allocator ? *stored_allocator : Allocator::DefaultAllocator();
 	auto new_data = allocator.Allocate(target_byte_count);
 	// copy data using sel
 	if (vector_type == VectorType::FOR_VECTOR) {
-		// gather straight out of the narrow payload: only the selected rows get widened
 		ForVector::WidenGather(data_ptr, for_stored_type, new_data.get(), type.InternalType(), sel, count);
 	} else {
 		FlattenVectorBuffer(new_data.get(), data_ptr, sel, count, type_size);

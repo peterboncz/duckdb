@@ -66,6 +66,10 @@ protected:
 	idx_t type_size;
 	idx_t capacity;
 	AllocatedData allocated_data;
+	//! Reused targets for the FOR gather-widen, so a sparse flatten costs no allocation per vector.
+	//! Two slots: one expression can hold slices of this buffer through two inputs at once.
+	mutable buffer_ptr<StandardVectorBuffer> widen_slots[2];
+	mutable uint8_t widen_slot = 0;
 };
 
 template <class T>
