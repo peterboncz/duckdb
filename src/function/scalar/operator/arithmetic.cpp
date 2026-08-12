@@ -71,18 +71,6 @@ static scalar_function_t GetScalarIntegerFunction(PhysicalType type) {
 	return function;
 }
 
-//! Hook 3: the same operation one width down. The FOR bound proof rules out overflow, so the plain kernels are exact.
-scalar_function_t GetForArithmeticFunction(char op, PhysicalType type) {
-	switch (op) {
-	case '+':
-		return GetScalarIntegerFunction<AddOperator>(type);
-	case '-':
-		return GetScalarIntegerFunction<SubtractOperator>(type);
-	default:
-		return GetScalarIntegerFunction<MultiplyOperator>(type);
-	}
-}
-
 template <class OP>
 static scalar_function_t GetScalarBinaryFunction(PhysicalType type) {
 	scalar_function_t function;

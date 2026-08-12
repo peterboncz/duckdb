@@ -188,16 +188,6 @@ void ForVector::WidenGather(const_data_ptr_t src, PhysicalType stored, data_ptr_
 	              [&](auto s, auto d) { WidenGatherLoop<decltype(s), decltype(d)>(src, target, sel, count); });
 }
 
-void ForVector::AlignStored(const Vector &vector, PhysicalType stored_type) {
-	auto &buffer = *vector.GetBufferRef();
-	if (buffer.for_stored_type == stored_type) {
-		return;
-	}
-	D_ASSERT(GetTypeIdSize(buffer.for_stored_type) < GetTypeIdSize(stored_type));
-	WidenInPlace(buffer.GetData(), buffer.for_stored_type, stored_type, buffer.for_count);
-	buffer.for_stored_type = stored_type;
-}
-
 void ForVector::WidenInPlace(const LogicalType &type, VectorBuffer &buffer) {
 	WidenInPlace(buffer.GetData(), buffer.for_stored_type, type.InternalType(), buffer.for_count);
 	if (!buffer.for_exploited) {

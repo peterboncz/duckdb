@@ -1,7 +1,5 @@
 #include "duckdb/common/enums/debug_verification_mode.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
-#include "duckdb/common/vector/for_vector.hpp"
-#include "duckdb/function/scalar/operators.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/expression_executor/bitmap_comparison.hpp"
 #include "duckdb/main/config.hpp"
@@ -40,10 +38,6 @@ ExecuteFunctionState::ExecuteFunctionState(const Expression &expr, ExpressionExe
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &bound_function = expr.Cast<BoundFunctionExpression>();
 		safe_autovec_arith = IsSafeAutoVecArithmetic(bound_function);
-		if (safe_autovec_arith) {
-			auto &name = bound_function.Function().GetName();
-			arith_op = name == "+" ? '+' : (name == "-" ? '-' : '*');
-		}
 		auto &children = bound_function.GetChildren();
 		for (idx_t child_idx = 0; child_idx < children.size(); child_idx++) {
 			auto &child = *children[child_idx];
@@ -95,8 +89,7 @@ bool ExecuteFunctionState::TryExecuteDictionaryExpression(const BoundFunctionExp
 	auto &input_sel = DictionaryVector::SelVector(unary_input);
 	if (safe_autovec_arith && AutoVecCountPaysOff(args.size()) && // dense dictionary arithmetic
 	    input_dictionary_size <= STANDARD_VECTOR_SIZE &&
-	    (DenseAutoVecPaysOff(args.size(), input_dictionary_size, GetTypeIdSize(result.GetType().InternalType())) ||
-	     ForVector::IsFor(DictionaryVector::Child(unary_input)))) { // a FOR child sees through to the narrow width
+	    DenseAutoVecPaysOff(args.size(), input_dictionary_size, GetTypeIdSize(result.GetType().InternalType()))) {
 		for (idx_t i = 1; i < dictionary_input_indices.size(); i++) { // every input must index the same dictionary
 			const auto &input = args.data[dictionary_input_indices[i]];
 			const auto sz = input.GetVectorType() == VectorType::DICTIONARY_VECTOR
@@ -110,8 +103,6 @@ bool ExecuteFunctionState::TryExecuteDictionaryExpression(const BoundFunctionExp
 		if (!output_dictionary || output_dictionary->data.size() != input_dictionary_size) {
 			output_dictionary = DictionaryVector::CreateReusableDictionary(result.GetType(), input_dictionary_size);
 			output_dictionary->id.clear(); // reused result has no stable dictionary id
-			// full-stride allocation and pipeline-local, so it may carry a FOR payload
-			output_dictionary->data.BufferMutable().cache_owned = true;
 		}
 		if (dictionary_input_chunk.data.empty()) {
 			dictionary_input_chunk.InitializeEmpty(args.GetTypes()); // reused across chunks
@@ -123,9 +114,7 @@ bool ExecuteFunctionState::TryExecuteDictionaryExpression(const BoundFunctionExp
 			dictionary_input_chunk.data[idx].Reference(DictionaryVector::Child(args.data[idx]));
 		}
 		dictionary_input_chunk.SetChildCardinality(input_dictionary_size);
-		if (!TryForArithmetic(dictionary_input_chunk, output_dictionary->data, input_dictionary_size)) {
-			expr.Function().GetFunctionCallback()(dictionary_input_chunk, state, output_dictionary->data);
-		}
+		expr.Function().GetFunctionCallback()(dictionary_input_chunk, state, output_dictionary->data);
 		result.Dictionary(output_dictionary, input_sel, args.size());
 		return true;
 	}
@@ -179,116 +168,10 @@ bool ExecuteFunctionState::TryExecuteDictionaryExpression(const BoundFunctionExp
 	return true;
 }
 
-//! Hook 3: +,-,* whose inputs are FOR payloads or constants runs the existing integer kernel one width down.
-//! The narrow twins share the payload buffers (little-endian reads make narrow constants exact), so besides
-//! the kernel itself the only work is flipping the FOR flags around the call.
-bool ExecuteFunctionState::TryForArithmetic(DataChunk &input, Vector &result, idx_t count) {
-	const auto wide = result.GetType().InternalType();
-	if (!arith_op || input.ColumnCount() != 2 ||
-	    (wide != PhysicalType::INT16 && wide != PhysicalType::INT32 && wide != PhysicalType::INT64)) {
-		return false;
-	}
-	// a side's ceiling is its payload maximum, or the constant itself (which must be in payload space)
-	uint64_t side_max[2];
-	bool is_for[2];
-	for (idx_t i = 0; i < 2; i++) {
-		auto &side = input.data[i];
-		if (side.GetType().InternalType() != wide) {
-			return false;
-		}
-		is_for[i] = ForVector::IsFor(side);
-		if (is_for[i]) {
-			side_max[i] = ForVector::MaxStored(side);
-			continue;
-		}
-		if (side.GetVectorType() != VectorType::CONSTANT_VECTOR || ConstantVector::IsNull(side)) {
-			return false;
-		}
-		const auto value = wide == PhysicalType::INT64   ? ConstantVector::GetData<int64_t>(side)[0]
-		                   : wide == PhysicalType::INT32 ? int64_t(ConstantVector::GetData<int32_t>(side)[0])
-		                                                 : int64_t(ConstantVector::GetData<int16_t>(side)[0]);
-		if (value < 0) {
-			return false;
-		}
-		side_max[i] = static_cast<uint64_t>(value);
-	}
-	if (!is_for[0] && !is_for[1]) {
-		return false;
-	}
-	uint64_t bound;
-	switch (arith_op) {
-	case '+':
-		bound = side_max[0] + side_max[1];
-		if (bound < side_max[0]) {
-			return false;
-		}
-		break;
-	case '-': // only constant - payload provably stays in unsigned space
-		if (is_for[0] || side_max[0] < side_max[1]) {
-			return false;
-		}
-		bound = side_max[0];
-		break;
-	default:
-		bound = side_max[0] * side_max[1];
-		if (side_max[1] != 0 && bound / side_max[1] != side_max[0]) {
-			return false;
-		}
-		break;
-	}
-	// the kernel width must hold the bound, the constants, and both payloads as they are stored
-	const uint64_t need = MaxValue(bound, MaxValue(side_max[0], side_max[1]));
-	idx_t width = need <= 0xFF ? 1 : need <= 0xFFFF ? 2 : need <= 0xFFFFFFFF ? 4 : 8;
-	for (idx_t i = 0; i < 2; i++) {
-		if (is_for[i]) {
-			width = MaxValue<idx_t>(width, GetTypeIdSize(ForVector::StoredType(input.data[i])));
-		}
-	}
-	if (width >= GetTypeIdSize(wide) || !result.GetBufferRef() || !result.GetBufferRef()->cache_owned) {
-		return false;
-	}
-	const auto stored = width == 1 ? PhysicalType::UINT8 : (width == 2 ? PhysicalType::UINT16 : PhysicalType::UINT32);
-	if (stored != for_width) { // the narrow twins are rebuilt only when the stored width changes
-		const auto ntype =
-		    width == 1 ? LogicalType::UTINYINT : (width == 2 ? LogicalType::USMALLINT : LogicalType::UINTEGER);
-		for_chunk.data.clear();
-		for_chunk.InitializeEmpty({ntype, ntype});
-		for_result = make_uniq<Vector>(ntype, nullptr);
-		for_width = stored;
-	}
-	// the twins share the payload buffers; the FOR flags drop for the duration of the call so the plain flat
-	// kernel sees plain flat vectors, and come back with the derived bounds afterwards
-	idx_t payload_rows[2];
-	for (idx_t i = 0; i < 2; i++) {
-		auto &side = input.data[i];
-		if (is_for[i]) {
-			ForVector::AlignStored(side, stored);
-			payload_rows[i] = side.GetBufferRef()->for_count;
-			ForVector::Discard(side);
-		}
-		for_chunk.data[i].Reinterpret(side);
-	}
-	for_chunk.SetCardinality(count);
-	ForVector::Discard(result); // any stale payload is fully overwritten
-	for_result->Reinterpret(result);
-	GetForArithmeticFunction(arith_op, stored)(for_chunk, *this, *for_result);
-	ForVector::Create(result, stored, bound, count);
-	for (idx_t i = 0; i < 2; i++) {
-		if (is_for[i]) {
-			ForVector::Create(input.data[i], stored, side_max[i], payload_rows[i]);
-			ForVector::MarkExploited(input.data[i]);
-		}
-	}
-	return true;
-}
-
 void ExecuteFunctionState::ResetDictionaryStates() {
 	// Clear the cached dictionary information
 	current_input_dictionary_id.clear();
 	output_dictionary.reset();
-	for_chunk.data.clear();
-	for_result.reset();
-	for_width = PhysicalType::INVALID;
 
 	for (const auto &child_state : child_states) {
 		child_state->ResetDictionaryStates();
@@ -399,9 +282,7 @@ void ExpressionExecutor::Execute(const BoundFunctionExpression &expr, Expression
 	                           execute_function_state.TryExecuteDictionaryExpression(expr, arguments, *state, result);
 	if (!dictionary_executed) {
 		if (expr.Function().HasFunctionCallback()) {
-			if (all_constant || !execute_function_state.TryForArithmetic(arguments, result, count)) {
-				expr.Function().Execute(arguments, *state, result);
-			}
+			expr.Function().Execute(arguments, *state, result);
 		} else if (all_constant && expr.Function().HasSelectCallback()) {
 			ExecuteConstantSelectFunction(expr, arguments, *state, result);
 		} else {

@@ -81,9 +81,6 @@ struct ForVector {
 	//! Widen a narrow payload where it lies. Always in place: a producer abandoning FOR part-way through a vector
 	//! has its source and target in the same bytes, so this must never be a forward copy.
 	static void WidenInPlace(data_ptr_t data, PhysicalType stored, PhysicalType target_type, idx_t count);
-	//! Widen the payload to a wider stored type but keep the vector FOR: the narrow twin of the cast an
-	//! executor would insert to make two operand widths meet.
-	static void AlignStored(const Vector &vector, PhysicalType stored_type);
 };
 
 } // namespace duckdb

@@ -82,9 +82,6 @@ public:
 
 	void ResetDictionaryStates() override;
 
-	//! Hook 3: run +,-,* over FOR payloads at the stored width, publishing the result as a FOR vector
-	bool TryForArithmetic(DataChunk &input, Vector &result, idx_t count);
-
 public:
 	unique_ptr<FunctionLocalState> local_state;
 	bool select_bitmap_capable = false;
@@ -93,12 +90,6 @@ public:
 
 private:
 	bool safe_autovec_arith = false;
-	//! The operator char (+,-,*) when safe_autovec_arith, so hook 3 can pick the narrow twin of the kernel
-	char arith_op = 0;
-	//! Narrow-typed twins of dictionary_input_chunk and the result; rebuilt only when the stored width changes
-	PhysicalType for_width = PhysicalType::INVALID;
-	DataChunk for_chunk;
-	unique_ptr<Vector> for_result;
 	//! The column index of the "unary" input column that may be a dictionary vector
 	//! Only valid when the expression is eligible for the dictionary expression optimization
 	//! This is the case when the input is "practically unary", i.e., only one non-const input column
